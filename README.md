@@ -127,7 +127,8 @@ the module that defines the command (`src/crowd/togi_bundle.py`) and the package
 Bundles are also imported from **source only** (no bytecode is read from or written to the repo; a `.pyc` planted in
 `__pycache__` is ignored) and with their repo paths **after the standard library**, so a `json.py` in the repo cannot replace
 `json`. Bytecode inside a repo's `__pycache__` is not part of the lock: nothing Togi starts ever reads it (every Python
-child gets `-X pycache_prefix=$TOGI_HOME/pycache`), so running a locked repo's tests in place doesn't disturb the lock.
+child that can load bundle code uses an impossible pycache prefix, `/dev/null/togi-no-bytecode`, so no bytecode is read
+from anywhere), so running a locked repo's tests in place doesn't disturb the lock.
 A bare `name.pyc` beside the source is importable and stays locked.
 
 The `[policy]` keys after `auto_polish` are optional; a manifest written before they existed behaves as if they held the
@@ -377,12 +378,27 @@ up from the cwd) is merged over the global registry; its entries win.
 
 ## Guardrails and their honest limits
 
-**Threat model.** Togi is built so that an *agent that has a shell* (or a `togi run` script) cannot approve its own
-payments, rewrite locked files, launder the audit log, or read the host's secrets. It is **not** built to stop a
-*hostile process running as the same user with full access to your files and to `$TOGI_HOME`*: such a process can
-read the approver hash and key, write approval files, and rewrite the log and the head pointer. That is
-out of scope for v0.1 (v0.2: an out-of-band approver, e.g. a web page or a keychain signature). The sandbox below
-narrows what a `togi run` script is, but it is a same-user process under a profile, not a VM.
+**Threat model: read this first.** Togi's guarantees hold when the agent reaches your tools **only through Togi's own
+surfaces**:
+- a shell restricted to `togi …` commands (for Claude Code: `--allowedTools "Bash(togi:*)"`, as the stone and the demo
+  run it);
+- `togi run` scripts (sandboxed on macOS);
+- the MCP bridge.
+
+Within that, an agent cannot approve its own payments, run code other than the locked code behind a money command,
+rewrite locked files, launder the audit log, or read the host's secrets.
+
+Togi does **not** protect you from an agent with an **unrestricted shell running as your own user**. Such an agent can:
+- edit Togi's own source, or plant files in its install;
+- read `$TOGI_HOME` (the audit key, approval records);
+- rewrite anything you can.
+
+No in-process check can stop the same user from changing the checker. If an agent needs a general shell, run it as a
+**separate OS user or in a container** that can reach only the `togi` command and its bundle repos read-only. The v0.2
+plan removes this limit: a small Togi service runs as you, holds the approver and audit keys, and executes gated
+commands; the agent gets only a thin client over a socket.
+
+The sandbox below narrows what a `togi run` script is, but it is a same-user process under a profile, not a VM.
 
 What is enforced in code:
 

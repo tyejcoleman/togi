@@ -20,6 +20,7 @@ from pathlib import Path
 from .bundle import Bundle
 from .errors import TogiError
 from .manifest import Manifest, ManifestError, load_manifest, locked_digest
+from . import paths
 from .paths import togi_home
 
 RESERVED_NAMES = {
@@ -183,13 +184,12 @@ def load(name: str) -> Loaded:
 
 def harden_imports() -> None:
     """Make importing a bundle read SOURCE only. `sys.dont_write_bytecode = True` (nothing is cached into the repo, so the
-    repo's own `__pycache__` stays whatever a person left there) and `sys.pycache_prefix` pointing at a Togi-owned directory
-    inside `$TOGI_HOME` (so Python looks for cached bytecode THERE and never beside the source): a `__pycache__/store.*.pyc`
-    planted in the repo, with the right header, is never read, and the code that runs is the code in the `.py` file that
-    the lock hashed. Cost: modules imported after this are compiled from source in each process (bundle code and any
+    repo's own `__pycache__` stays whatever a person left there) and `sys.pycache_prefix` pointing at a path that cannot
+    exist (`paths.NO_BYTECODE_PREFIX`): no `.pyc` is read for bundle code, whether planted in the repo or anywhere else,
+    and the code that runs is the code in the `.py` file that the lock hashed. Cost: modules imported after this are compiled from source in each process (bundle code and any
     standard-library module it pulls in lazily); Togi's own modules are already imported by then."""
     sys.dont_write_bytecode = True
-    sys.pycache_prefix = os.path.join(os.path.abspath(str(togi_home())), "pycache")
+    sys.pycache_prefix = paths.NO_BYTECODE_PREFIX     # impossible path: bytecode for bundle code is never read, never planted
 
 
 def _stdlib_entries() -> set[str]:

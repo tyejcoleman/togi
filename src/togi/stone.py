@@ -140,8 +140,7 @@ class Sandbox:
         (self.root / approvals.SANDBOX_MARKER).write_text("a stone sandbox: see approvals.sandbox_optin\n")
         shim = self.bin / "togi"
         # the same isolated launch as bin/togi: python -I, Togi's src added by the launcher, no PYTHONPATH
-        pc = " ".join(f'"{a}"' for a in paths.pycache_args(self.home))
-        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I {pc} "{paths.launcher_path()}" "$@"\n')
+        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I "{paths.launcher_path()}" "$@"\n')
         shim.chmod(0o755)
         self.agent_session = f"stone-{secrets.token_hex(4)}"
         self.harness_session = f"harness-{secrets.token_hex(4)}"

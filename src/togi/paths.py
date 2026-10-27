@@ -188,12 +188,18 @@ def launcher_path() -> Path:
     return Path(__file__).resolve().parent / "_launch.py"
 
 
+# Where bundle code may look for cached bytecode: a path that cannot exist (a "directory" under the /dev/null device), so
+# no compiled file is ever read for a bundle and none can be planted for one, by anyone, at any moment. Every bundle
+# module is compiled from its locked source on each start. (A Togi-owned cache dir was not enough: whoever can write
+# that dir could plant a .pyc that runs instead of the locked source while the lock still verifies.)
+NO_BYTECODE_PREFIX = "/dev/null/togi-no-bytecode"
+
+
 def pycache_args(home: Path | str | None = None) -> list[str]:
-    """`-X pycache_prefix=...` for every Python child Togi starts: bytecode is read from and written to a Togi-owned
-    directory, never a repo's `__pycache__`. That is why repo bytecode caches can stay out of the lock set: nothing
-    Togi runs ever reads them. (Works under `-I`, unlike the PYTHONPYCACHEPREFIX variable.)"""
-    base = Path(home) if home is not None else togi_home()
-    return ["-X", f"pycache_prefix={os.path.join(os.path.abspath(str(base)), 'pycache')}"]
+    """`-X pycache_prefix=<impossible path>` for every Python child Togi starts that can load bundle code (stone tests,
+    the describe child, the `togi run` child). Works under `-I`, unlike PYTHONPYCACHEPREFIX. `home` is ignored (kept for
+    call-site compatibility)."""
+    return ["-X", f"pycache_prefix={NO_BYTECODE_PREFIX}"]
 
 
 def isolated_argv(args: list[str] | tuple[str, ...] = ()) -> list[str]:
@@ -203,4 +209,4 @@ def isolated_argv(args: list[str] | tuple[str, ...] = ()) -> list[str]:
     nothing planted in the directory a person happens to be standing in (a `hmac.py`, a `json.py`) and nothing in
     `PYTHONPATH` can run inside Togi. The launcher puts Togi's own `src` on `sys.path` explicitly. Every place Togi
     starts itself (the `togi` launcher, the `togi run` host re-exec, the stone's `togi` shim and MCP server) uses this."""
-    return [sys.executable, "-I", *pycache_args(), str(launcher_path()), *args]
+    return [sys.executable, "-I", str(launcher_path()), *args]

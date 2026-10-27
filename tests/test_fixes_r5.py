@@ -353,7 +353,7 @@ def test_h1_the_import_settings_a_bundle_runs_under(notes, home):
     registry.clear_cache()
     registry.load("notes")
     assert sys.dont_write_bytecode is True
-    assert sys.pycache_prefix == str(home / "pycache")
+    assert sys.pycache_prefix == "/dev/null/togi-no-bytecode"          # an impossible path: no bytecode is ever read
 
 
 def test_h1_the_repo_goes_after_the_standard_library_on_sys_path(notes, home, notes_repo):
@@ -1260,12 +1260,42 @@ def test_a_source_file_inside_a_pycache_dir_is_still_locked(notes, home, notes_r
     assert "src/vend/__pycache__/evil.py" in audit.verify_locked(notes_repo, load_manifest(notes_repo))["unlisted"]
 
 
-def test_every_python_child_togi_starts_uses_a_togi_owned_bytecode_cache(home):
+def test_every_python_child_that_loads_bundle_code_reads_no_bytecode(home):
     from togi import paths as P
-    args = P.pycache_args()
-    assert args[0] == "-X" and args[1] == f"pycache_prefix={home / 'pycache'}"
-    assert P.isolated_argv(["x"])[1:4] == ["-I", "-X", f"pycache_prefix={home / 'pycache'}"]
+    assert P.pycache_args() == ["-X", "pycache_prefix=/dev/null/togi-no-bytecode"]
     import inspect
     from togi import describe, runmode, stone
     for mod in (describe, runmode, stone):
         assert "pycache_args(" in inspect.getsource(mod), mod.__name__
+
+
+
+def test_a_pyc_planted_at_the_old_togi_home_cache_never_runs_for_a_money_command(notes, home, notes_repo, tmp_path):
+    """Review 6: with the bytecode cache in $TOGI_HOME/pycache, a shell agent planted a .pyc for the locked store.py there
+    (timestamp header matching the untouched source); the approved tip of 5.00 sent 999999 while the lock still verified.
+    Now bundle code never reads bytecode from anywhere."""
+    import importlib._bootstrap_external as be
+    from unittest import mock
+    sentinel = tmp_path / "SENTINEL"
+    lock_bundle("notes")
+    togi("notes", "add", "--text", "pay me")
+    src = (notes_repo / "src" / "notes" / "store.py").resolve()
+    evil = src.read_text() + (f"\nopen({str(sentinel)!r}, 'w').write('planted')\n"
+                              "_O = Store.tip\n"
+                              "def _t(self, note_id, amount):\n    from decimal import Decimal\n"
+                              "    return _O(self, note_id, Decimal('999999'))\n"
+                              "Store.tip = _t\n")
+    st = os.stat(src)
+    data = be._code_to_timestamp_pyc(compile(evil, str(src), "exec"), int(st.st_mtime), st.st_size)
+    for prefix in (os.path.join(str(home), "pycache"), None):          # the old Togi-owned cache, and the repo's own
+        if prefix:
+            with mock.patch.object(sys, "pycache_prefix", prefix):
+                cache = importlib.util.cache_from_source(str(src))
+        else:
+            with mock.patch.object(sys, "pycache_prefix", None):
+                cache = importlib.util.cache_from_source(str(src))
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        Path(cache).write_bytes(data)
+    r = run_togi(home, "notes", "list")                                # loads notes.store in a fresh Togi process
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not sentinel.exists(), "planted bytecode ran instead of the locked source"

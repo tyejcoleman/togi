@@ -169,7 +169,7 @@ def test_claude_command_shape_and_env_scrub(notes, home, monkeypatch):
         cfg = json.loads(mcp_cmd[mcp_cmd.index("--mcp-config") + 1])
         srv = cfg["mcpServers"]["togi"]
         assert srv["command"] == sys.executable
-        assert srv["args"] == ["-I", *stone.paths.pycache_args(), str(stone.paths.launcher_path()), "mcp", "serve", "notes"]   # isolated: python -I
+        assert srv["args"] == ["-I", str(stone.paths.launcher_path()), "mcp", "serve", "notes"]   # isolated: python -I
         assert srv["env"]["TOGI_HOME"] == str(sb.home) and srv["env"]["TOGI_AGENT"] == "stone"
         assert "PYTHONPATH" not in srv["env"]                      # the launcher adds Togi's src itself
         assert "--strict-mcp-config" in mcp_cmd and "--tools=" in mcp_cmd

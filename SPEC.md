@@ -142,8 +142,8 @@ effect listed in policy `approve_effects`).
   - **The lock set is what is importable, not only what a glob names.** It is every file under a locked pattern (nothing
     skipped: `__pycache__`, `build`, `dist`, `venv`, `node_modules` are walked like any directory; only the repo's own `.git`
     and `.togi`, and **bytecode (`.pyc`/`.pyo`) inside `__pycache__`**, are left out. No Python process Togi starts ever
-    reads a repo's bytecode cache: in-process imports use `sys.pycache_prefix`, every child gets `-X pycache_prefix=`
-    pointing into `$TOGI_HOME`, so that bytecode cannot change what runs, and hashing it would make every ordinary test run
+    reads bytecode for bundle code at all: in-process imports and every child that can load bundle code use a pycache
+    prefix that cannot exist (`/dev/null/togi-no-bytecode`), so that bytecode cannot change what runs, and hashing it would make every ordinary test run
     "break" the lock) **plus the shadows of every locked importable file**: in its directory a package directory of the
     same name that has an `__init__` (and everything in it), any `name.<suffix>` extension module or bare `name.pyc`; and,
     for a locked file not under `src/`, the same names in `src/`, which is first on the import path.
@@ -161,7 +161,8 @@ effect listed in policy `approve_effects`).
     time and again at use time, no request is filed, `togi approve` refuses it from the snapshot (§3), and `togi doctor`
     warns (`<bundle>: gated code locked`). Not applied inside the stone's own sandbox (§5), nor to a bundle that needs no lock.
   - **Source only, standard library first.** A bundle is imported with `sys.dont_write_bytecode = True` and `sys.pycache_prefix`
-    set to `$TOGI_HOME/pycache`, so a `.pyc` planted in the repo's `__pycache__` (an unchecked hash-based one is trusted
+    set to an impossible path (`/dev/null/togi-no-bytecode`; a `$TOGI_HOME` cache could be planted by whoever can write
+    `$TOGI_HOME`), so a `.pyc` planted in the repo's `__pycache__` or anywhere else (an unchecked hash-based one is trusted
     whatever the source says) is never read and nothing is cached into the repo; and its repo paths (`<repo>/src`, then
     `<repo>`) go on `sys.path` **after the standard library and before `site-packages`**, so a `json.py`, `decimal.py` or
     `hmac.py` in the repo or its `src/` cannot replace the standard library, while a registered repo still beats an old

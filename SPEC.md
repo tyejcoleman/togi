@@ -1,4 +1,4 @@
-# Togi — spec v0.1, revision r3 (2026-10-27)
+# Togi — spec v0.1, revision r4 (2026-10-27)
 
 Revision r1 hardens the guardrails after an independent refutation (FIXES-r1.md). Contract changes are additive: a
 manifest or bundle written against r0 keeps working. What changed is marked **(r1)**.
@@ -11,6 +11,17 @@ Revision r3 closes the one hole left in r2: the human gates that change a repo (
 evaluation approval, a human `apply`) accepted a throwaway `test`-scope approver, which an agent can create for itself.
 They now accept only the default-scope approver, and the audit log records the scope (§3, §6). What changed is marked
 **(r3)**.
+
+Revision r4 (FIXES-r4.md) answers the final design review. Two of the six guarantees did not hold: the human gates loaded
+code from the current directory or `PYTHONPATH` (Togi now starts itself isolated, §3), and a throwaway test approver could
+move money in any bundle that did not check scope (a bundle must now opt in with `[policy] test_approvals = true`, §2).
+The rest had gaps: what a person is shown at `approve` is recomputed rather than read from the pending file and is what is
+signed (§3); single use is a signed record outside `$TOGI_HOME` (§2); the money path checks the lock (`[policy]
+require_lock`, §2, §6); the evaluation cache is signed (§6); the output caps hold on the CLI (§3); apply and revert need an
+authenticated audit log, the lock entry's signature is verified, polish may touch only plain text, and unknown flag names
+and write-command notes are not journaled verbatim (§4, §6); `togi run` hides installed bundle modules from the script
+(§3). What changed is marked **(r4)**. Contract changes for bundles: two optional `[policy]` keys, and the example
+`tip_send` that shows the scope check.
 
 Togi (研ぎ, "sharpening") turns any set of capabilities into a command-line tool that AI agents can
 learn in one call, use without setup, and improve under audit.
@@ -115,12 +126,35 @@ effect listed in policy `approve_effects`).
   of a reshape proposal and a human `apply` (§3, §6). Money `approve`/`deny` keep accepting it.
 - **(r1)** At most 20 pending approvals per bundle; a further distinct request is refused (`too_many_pending`) with a
   `next`. An identical retry returns the existing request.
+- **(r4) A bundle must opt in before a test-scope grant counts at all.** A `test`-scope grant (§ above) for a gated command
+  is refused with `test_scope_refused` (status `refused`, exit 2) unless the bundle's manifest says
+  `[policy] test_approvals = true`: `togi approve` under a throwaway approver refuses up front, before any prompt, and a
+  grant minted anyway (the record is signed by a test approver) is refused when `--approval` presents it, before the
+  command runs and without spending the grant. The stone's own sandbox run and the bundle tests it starts opt in for
+  themselves (`TOGI_STONE_SANDBOX`, §5). A bundle that opts in is saying its gated commands do what the rule above says;
+  `examples/notes` does (`tip_send` checks `ctx.approval_scope` against its own `NOTES_TEST_MODE`).
+- **(r4) Single use is a signed record outside `$TOGI_HOME`.** The `status` and `.claimed` marker in the approval file are
+  bookkeeping an agent can edit (the grant's MAC covers "approved", not "unused"). The authority is the **spent-approval
+  record** `spent.jsonl` (+ `spent.head`) in the approver home (§3): one line per spent approval, appended under an exclusive
+  lock, `{n, id, ts, home, prev, mac}` with `mac = HMAC-SHA256(approver.key, canonical{n, id, ts, home, prev})` chained to the
+  previous line, and a MAC'd head counting the lines. `check_for_use` refuses (`approval_used`) an id found there or with a
+  `.claimed` marker. The host writes the record **before** the command runs (`approvals.claim`) and does not run the command if
+  it cannot be written. A line missing, edited, reordered, or a head that disagrees with the log, is `spent_log_damaged`:
+  every approval is refused until a person looks. A line that is not a whole record (a torn write) is ignored.
+- **(r4) The money path checks the lock.** At request time and again at use time (before the approval is spent) a gated
+  command requires `audit.lock_state` to be `verified`: `.togi/locked.sha256` exists, every locked file matches it, no symlink
+  stands under a locked pattern, it is the one the latest `lock` audit entry recorded (and that entry's key id and mac verify),
+  and the audit log itself is intact and authenticated (§6). A failing lock is `lock_check_failed`; **no lock file** is
+  `not_locked` unless `require_lock` is false (`Manifest.lock_required()`). Both are `refused`. No request is filed for a
+  bundle that fails. The approval prompt shows the lock state, and `togi approve` refuses a failing one. The stone's own
+  sandbox run is exempt (§5).
 
 **Context** (optional): a parameter named `ctx: togi.Context` is injected, never a CLI flag. It
 gives `ctx.state_dir` (per-bundle writable dir), `ctx.journal_note(dict)`, `ctx.agent`
 (from `TOGI_AGENT` env), `ctx.surface` (`cli` | `run` | `mcp`) and **(r2)** `ctx.approval_scope`
 (`"default"` | `"test"` | `None`: the scope of the approver that signed the approval this call arrived with; `None` when
-there was none).
+there was none). **(r4)** `ctx.journal_note(dict)` from a `write`, `money` or `admin` command is journaled as its keys and
+the *types* of its values (`{"amount": "str"}`); a `read` command's note is stored as written.
 
 **Manifest** (`togi.toml` at the bundle repo root):
 ```toml
@@ -146,10 +180,16 @@ auto_polish = true                    # polish changes may auto-apply if the sto
 apply_driver = "claude"               # (r1, optional) minimum driver `togi apply` evaluates with: "claude" (default) | "script"
 apply_runs = 3                        # (r1, optional) minimum runs per task in `togi apply` (default 3, at least 2)
 run_env = ["PAYPAL_CLIENT_ID"]        # (r1, optional) env vars the `togi run` host keeps (default: none)
+test_approvals = false                # (r4, optional) accept grants signed by a throwaway test-scope approver? default false
+require_lock = true                   # (r4, optional) gated commands need a verified `togi lock`; default: true iff [tiers].locked is non-empty
 ```
 
-`apply_driver`, `apply_runs` and `run_env` are optional; absent, they hold the defaults shown. A caller of `togi apply`
-may raise the driver and the runs, never lower them.
+`apply_driver`, `apply_runs`, `run_env`, `test_approvals` and `require_lock` are optional; absent, they hold the defaults
+shown (`require_lock`: true when the bundle has locked tiers of its own, false when it has none). A caller of `togi apply`
+may raise the driver and the runs, never lower them. **(r4)** `test_approvals` and `require_lock` must be TOML booleans
+(`"true"` or `1` is a manifest error). `test_approvals = true` is a statement that every gated command of the bundle checks
+`ctx.approval_scope` (or only moves fakes); see the rule below. `require_lock = false` is the only way for a bundle with
+locked tiers to run gated commands with no `.togi/locked.sha256`.
 
 **Registration:**
 - `togi add <path-to-bundle-repo>` records the bundle in the registry: `$TOGI_HOME/bundles.toml`
@@ -160,6 +200,19 @@ may raise the driver and the runs, never lower them.
 ---
 
 ## 3. CLI surface (agent-native conventions)
+
+**(r4) Starting Togi.** `bin/togi` runs `python3 -I src/togi/_launch.py ARGS`: the interpreter is **isolated** (`-I`: no current
+directory or script directory on `sys.path`, every `PYTHON*` variable ignored, no user site) and the launcher puts Togi's own
+`src` on `sys.path` explicitly. Without it `python3 -m togi` puts the current directory first and honours `PYTHONPATH`, so a
+stdlib-named file (`hmac.py`, `json.py`) planted where a person runs `togi approve` / `lock` / `revert` / `apply` would run
+inside the person's approval session. Every place Togi starts itself uses the same form (`paths.isolated_argv`): the
+`togi run` host re-exec, the stone's `togi` shim and its MCP server. `python3 -m togi` is handed to the launcher by the package's
+first statements, before any other import; `cli.main`, as the entry point of any other normal interpreter, restarts through the
+launcher before dispatching. The human gates (`approve`, `deny`, `lock`, `revert`, `apply`, `approver setup`) additionally
+**refuse** (`unsafe_interpreter`, `refused`) in an interpreter that is not isolated and has a `PYTHON*` variable set or the
+current directory (`''`, `.`) on `sys.path`; the check comes after the TTY and scope checks and before any prompt. Bundles are
+imported from their registered repo paths (`<repo>/src`, `<repo>`), which are added explicitly; `PYTHONPATH` no longer reaches
+them, including through a manifest's `run_env`.
 
 **Output and exit codes:**
 - When stdout is not a TTY, output is compact JSON on a single line.
@@ -172,6 +225,13 @@ may raise the driver and the runs, never lower them.
 with `"more": "togi … --offset N"`. Output never exceeds ~8 KB unless `--full` is given. **(r1)** That holds for
 success data, error envelopes, `--dry-run`, every host command (which also honour `--fields`, `--limit`, `--offset`),
 text documents (`skill`, `tools`, help) and MCP results (cut with a note); a `more` hint never carries a long argument back.
+**(r4)** The cut handles every shape and ends in a hard cap: a list loses its tail; otherwise the largest list or dict is
+halved (a dict keeps its first keys; `more` says to narrow with `--fields` or lift the cap with `--full`), then long strings
+are cut, then the value becomes a text preview; a bare `fit_any` + `hard_cap` guarantees the serialised envelope is never larger
+than ~8 KB without `--full`. What a command prints to stdout while it runs is captured (first 4 KB kept) and written to stderr
+with a note, never to stdout; the journal records `printed_bytes`. In code mode a script's error message is cut at 1000
+characters in the child and again in the host, and a request line over 1 MB (or one without a line end) stops the script
+(`protocol_error`).
 
 **Commands:**
 - `togi` / `togi skill`: the **index**. What Togi is, the global conventions in ≤15 lines, then one
@@ -192,12 +252,18 @@ text documents (`skill`, `tools`, help) and MCP results (cut with a note); a `mo
   - **(r1)** The host first re-execs itself with an allowlisted environment (PATH, HOME, TMPDIR, LANG, LC_*, TOGI_*,
     and the registered bundles' `[policy] run_env`; the `run_env` values travel over a pipe, not the environment), so its
     visible environment holds no secrets.
+  - **(r4)** The re-exec uses the isolated launcher (§3, "Starting Togi"): `python -I _launch.py ...`, no `PYTHON*` variable in the
+    host's environment (not even one a manifest lists in `run_env`).
   - The child gets a scrubbed environment (no secrets, only PATH/HOME/TMPDIR/LANG plus the host's TOGI_HOME,
     TOGI_SESSION and TOGI_AGENT, so a nested `togi` stays in the same home), a temp working dir, a timeout
     (`--timeout`, default 60 s) and an output cap.
   - **(r1)** On macOS the child runs under `sandbox-exec`: no network; file contents readable only from the Python
     install, its temp dir and OS directories (so not any registered bundle repo, `$TOGI_HOME` or the user's home);
-    writes only to its temp dir; no process inspection or signals to other processes. A *standard* profile (deny-list of
+    writes only to its temp dir; no process inspection or signals to other processes. **(r4)** Where a registered bundle is
+    *installed* (its module sits in the Python install's `site-packages`), the paths there that are that module (package or
+    module file, extension module, `.dist-info` / `.egg-info`, `.pth`, editable-install finders) are denied last with
+    `file-read*` (a generic `file*` deny does not outrank the specific allow of the install), so `import crowd` fails in the
+    script too. A *standard* profile (deny-list of
     the user-data zones) is used if the *strict* one cannot start Python. The result reports `sandboxed: true|false` (and
     `sandbox_level`); if `sandbox-exec` is missing or unusable the run falls back to unsandboxed and says why.
   - Only what the script prints is returned.
@@ -207,6 +273,19 @@ text documents (`skill`, `tools`, help) and MCP results (cut with a note); a `mo
   - Requires stdin and stdout to be TTYs, and refuses when `TOGI_AGENT` is **set** (even to the empty string), when
     `TOGI_RUN` is set, or when a live `togi run` host is an ancestor process (**r1**: each host registers
     `$TOGI_HOME/run/<pid>`; a command-line match is a second check).
+  - **(r4)** Also refuses, after those checks and before any prompt, in an interpreter that is not isolated and has a
+    `PYTHON*` variable set or the current directory on `sys.path` (`unsafe_interpreter`; see "Starting Togi" above).
+  - **(r4) What is shown is what is signed.** `approve` does not trust the pending file (the requester wrote it). Before
+    anything is shown it **recomputes**: the args hash from the arguments it will display (must equal the record's
+    `args_hash`), the binding (repo path, manifest version, locked-files digest) from the live repo (must equal
+    `binding_hash`: `approval_stale`), the lock state from the live lock (a failing lock is `lock_check_failed`, an absent one
+    where `require_lock` applies is `not_locked`), and the **summary and the confirmation word from the bundle's own command**,
+    produced by loading the bundle in an isolated child process with a scrubbed environment (`_describe.py`; the bundle's
+    import-time code never runs in the person's session). Any mismatch with the pending record is refused
+    (`approval_tampered`), as is a `test`-scope approver for a bundle that has not opted in (`test_scope_refused`). The
+    prompt shows the recomputed values and the lock state, and `grant` signs exactly those (it re-reads the record and refuses,
+    `approval_changed`, if it no longer agrees). `deny` shows the record as filed and verifies nothing: a denial is signed too
+    and cannot be turned into an approval.
   - Shows the bundle, repo path, version, summary (cut at 300 characters) and arguments, with control characters, ANSI
     escapes and bidi overrides shown as `\uXXXX`, and requires typing the confirmation word shown (e.g. the drop id).
   - **(r1)** Then requires the **approver passphrase**: set once by a person with `togi approver setup` (12+ characters,
@@ -224,7 +303,10 @@ text documents (`skill`, `tools`, help) and MCP results (cut with a note); a `mo
     typed word, the passphrase or any expensive work; `togi apply` says so up front when a person will be needed. There
     is no exception for example or test bundles: the rule is the same for every repo, and the test suite reaches the
     default scope by pointing the "fixed" location at a temp dir (a password-database shim), not by this variable.
-    `approve`, `deny` and `approver setup` are not repo gates and accept either scope.
+    `approve`, `deny` and `approver setup` are not repo gates and accept either scope. **(r4)** They accept a test scope for
+    a given bundle only if that bundle opted in with `test_approvals` (§2).
+  - **(r4)** The approver home also holds `spent.jsonl` and `spent.head` (§2, the spent-approval record); a replaced approver
+    key retires them (renamed `*.old`), since only the old key could verify them and the grants it signed are dead.
   - Writes the approval, signed (§2), with an expiry (default 15 min), and prints its `scope`.
   - `togi approvals` lists pending approvals. `togi approver status` says whether an approver is set up and whether it is locked.
   - Document honestly: the TTY check stops an agent using a normal non-interactive shell; the passphrase stops one that
@@ -262,8 +344,15 @@ Every error message says what to run next. There are no interactive prompts exce
  "ok","status","error_code","duration_ms","out_bytes","out_tokens_est","retry_of": <ts or null>}
 ```
 - `args_shape` records types only, never values: money values and secrets never enter the journal.
-  Values for read commands are hashed. **(r1)** Records of unknown commands and flags are values-free too: flag names are
-  kept, a word is kept only if it is a near-miss of a real command word, every other token is `<num>` / `<str>`.
+  Values for read commands are hashed. **(r1)** Records of unknown commands and flags are values-free too: a word is kept
+  only if it is a near-miss of a real command word, every other token is `<num>` / `<str>`. **(r4)** A flag name is kept only
+  if it is a flag the host or one of the bundle's commands has (`journal.HOST_FLAGS`, the bundle's parameters and their
+  `--no-` forms); any other name is recorded as `#` + 8 hex digits of its hash (`--#1a2b3c4d`), because a made-up name is where
+  a value hides. An unknown-flag record also carries `near`, the *known* flag it most resembles (`--tag` for `--tgs`),
+  so the friction summary (`unknown_flags: [{command, flag, count, near}]`) still points hone at the typo.
+- **(r4)** `ctx.journal_note` payloads (`event: "note"`) from write/money/admin commands are `{key: type}` only (`"str"`,
+  `"int"`, `"float"`, `"bool"`, `"list"`, `"dict"`, `"null"`); read commands' notes are stored as written. A call whose
+  command printed to stdout also records `printed_bytes`.
 - **(r1)** Any invocation of `approve`, `deny`, `lock`, `revert`, `apply` or `approver` writes an `event: "host_attempt"`
   line to the `_host` journal BEFORE its flags are parsed (argv shape only), and every approver-passphrase attempt writes
   `event: "passphrase_attempt"`.
@@ -312,6 +401,15 @@ command_prefix = "togi approve"             # guard compliance: the agent must n
 - **script:** replays a `script = [...]` list of commands in the task file. Deterministic, used
   in CI/tests.
 
+**(r4) The sandbox is the one place a bundle may use test-scope approvals and skip the lock.** A stone run (`Sandbox`) and the
+bundle's own deterministic tests (`run_tests`) each live in one throwaway root holding `home/` (the `$TOGI_HOME`),
+`approver/` (the `$TOGI_APPROVER_HOME`) and a marker file, and set `TOGI_STONE_SANDBOX=<root>`. `approvals.sandbox_optin()` is
+true only when that variable names a directory with the marker whose `home` is this `$TOGI_HOME` and whose `approver` is this
+`$TOGI_APPROVER_HOME`; the variable alone, in any other home, does nothing. Inside it a bundle accepts test-scope grants
+without `test_approvals` and the money path skips the lock check (a throwaway home has no audit key to anchor a lock with, and
+nothing there is real). The stone's `togi` shim and MCP server are started isolated (`paths.isolated_argv`, §3) and no longer
+use `PYTHONPATH`. A `togi run` child launched inside the sandbox inherits the variable.
+
 **Output:** a result JSON in `$TOGI_HOME/stone/<bundle>/<run-id>.json` plus a short text summary.
 
 **Scoring** (used by apply):
@@ -340,7 +438,13 @@ if already evaluated.
 
 **3. `togi apply <id>`:**
 1. Re-checks the audit chain and the locked-file hashes (`.togi/locked.sha256`, written by `togi lock <bundle>`; `doctor`
-   verifies), and that the stored diff is the one hone stored. Paths are **(r1)** normalised (`.`, `..`, `//`),
+   verifies), and that the stored diff is the one hone stored. **(r4)** The chain must be intact **and authenticated** (`audit_unauthenticated`
+   otherwise): at least one entry signed by this machine's key, every entry after the first signed one signed too (an unsigned
+   prefix from before signatures is allowed). The lock file is **anchored**: it counts only if it is exactly what the latest `lock`
+   audit entry recorded (`diff_sha256` = sha256 of the file) AND that entry is genuine (`hash` recomputed from its content, `kid` =
+   this machine's key id, `mac` verifies), so a locked file edited together with a hand-rewritten `locked.sha256` and a forged `lock`
+   line is `not anchored`. A symlink standing under a locked pattern, or in place of a locked directory or of an ancestor of locked
+   files, is reported by `verify_locked` (`symlinks`) and fails the lock; `togi lock` refuses to pin such a repo (`locked_symlink`). Paths are **(r1)** normalised (`.`, `..`, `//`),
    matched case-insensitively and Unicode-normalised, followed through symlinks, and refused if they leave the repo or
    contain control, format or line/paragraph-separator characters.
 2. **(r2) May this be evaluated at all?** Evaluating copies the repo, applies the diff and runs the stone, i.e. it
@@ -353,12 +457,16 @@ if already evaluated.
      `evaluation_approval` whose scope is not `default` is never honoured, so one signed with a throwaway approver
      found in `meta.json` unlocks nothing. Without it, `togi apply` returns `needs_human` (exit 3, `reason: "evaluation_needs_human"`) and runs
      nothing;
-   - a **polish** proposal keeps automatic evaluation, but may touch **no code-bearing file**: extension `.py`, `.pyc`,
-     `.so`, `.sh`, `.js`, `.ts` (case-insensitive), or new content starting with `#!`. Otherwise it is rejected
-     (`code_in_polish`, audited), at `hone` and again here;
+   - a **polish** proposal keeps automatic evaluation, but may touch **only plain text**: **(r4)** an allowlist, not a list of bad
+     extensions: `.md`, `.txt`, `.json`, `.yaml`, `.yml` and `.toml` other than `pyproject.toml` / `togi.toml` (case-insensitive).
+     Everything else counts as code for this rule (`.py`, `.sh`, `.cfg`, `.ini`, `.html`, `.pth`, a file with no extension...),
+     and so does new content starting with `#!`. Otherwise it is rejected (`code_in_polish`, audited), at `hone` and again here;
    - belt and braces: both rules are checked again right before the stone runs.
 3. Copies the bundle repo to a temp dir, applies the diff there, and runs the stone (same tasks, same model) on both
-   the current version and the candidate, with at least the policy's `apply_driver` and `apply_runs` (**r1**).
+   the current version and the candidate, with at least the policy's `apply_driver` and `apply_runs` (**r1**). **(r4)** The
+   comparison is cached in `proposals/<id>/evaluation.json` and the cache is signed: `mac` = HMAC-SHA256(audit key, domain +
+   proposal id + the record). A cache with no mac, a wrong one or one signed for another proposal is ignored (the stone runs
+   again; `togi review` does not show it).
 4. **Decides:**
    - **locked:** never.
    - **reshape:** needs a human **again** (r2: this is a second, separate decision after the evaluation one): TTY + typed
@@ -385,6 +493,11 @@ if already evaluated.
 from library code run under a throwaway approver. Entries written before r3 have no `scope` and still verify (the hash
 covers the keys an entry has).
 **(r1)** `mac` is HMAC-SHA256 over `hash` under `$TOGI_HOME/audit.key` (0600, created on first use); `kid` names the key.
+**(r4)** `lock_anchored` (and so `verify_locked`, `doctor`, the money path) verifies the `kid` and `mac` of the `lock` entry it
+relies on, not just its `diff_sha256`. An audit log in which NO entry is signed (it predates signatures) is chain-bound only:
+`authenticated` is false, an ordinary writer cannot append to it (`audit_unauthenticated`), `apply` and `revert` refuse it, and a
+person's `togi lock` (`anchor=True`) is what signs the next entry onto it. `authenticated` is true when at least one entry is
+signed by this machine's key, every later one is too, and the head matches.
 Lines are pure ASCII and are read by splitting on `\n` only. `togi log --verify` recomputes the chain, checks the macs and
 the head pointer (`$TOGI_HOME/state/<bundle>/audit.head`, also MAC'd); a missing or unreadable head is a failure.
 `--chain-only` checks the hash chain alone (for CI on a clean checkout) and says so. Every writer verifies the whole
@@ -432,6 +545,14 @@ It goes through the same host execution path (guards, journal).
     reverts, evaluates and applies; `lock`, `revert`, the evaluation approval and a human `apply` each refuse a test approver
     before any prompt; a test-scope `evaluation_approval` in `meta.json` unlocks nothing; audit entries carry `scope` (inside
     the hash, absent in older entries without breaking them); `host_attempt` journals the scope;
+  - **(r4)** one regression test per item of FIXES-r4.md (`tests/test_fixes_r4.py`): planted `hmac.py`/`json.py`/`decimal.py` in the
+    cwd and on `PYTHONPATH` never run in `togi approve` through the real launcher (`bin/togi`), `python3 -m togi`, the `togi run`
+    host re-exec and the stone shim; test-scope grants refused without `test_approvals`; args/summary/word/binding edits refused at
+    approve; a consumed approval flipped back to `approved` stays spent, the spent record's damage cases fail closed; money
+    refused without a verified lock (absent, edited, unanchored, forged `lock` entry, symlink); unsigned evaluation cache ignored;
+    the measured output cases (5,000-key dict, one 100 KB string, 100 KB of prints, a 200 KB `togi run` exception); unauthenticated
+    legacy log; the polish allowlist; hashed flag names and shaped notes; an installed bundle module hidden from the sandboxed
+    child (under the real `sandbox-exec`);
   - `run` proxying (and that a child can't read the parent's environment, including through the parent process, nor read
     bundle repos or `$TOGI_HOME`, nor reach the network);
   - journal shape (no values);

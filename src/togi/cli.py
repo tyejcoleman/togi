@@ -139,6 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     global PROCESS_ENTRY, ENTRY_ARGV
     if argv is None:
         PROCESS_ENTRY, ENTRY_ARGV = True, list(sys.argv[1:])
+        _ensure_isolated()
     argv = list(sys.argv[1:] if argv is None else argv)
     pre_mode = _scan_mode(argv)
     common = _scan_common(argv)
@@ -164,6 +165,19 @@ def main(argv: list[str] | None = None) -> int:
         return write_reply(finalize(reply, common, argv))
     except BrokenPipeError:  # pragma: no cover
         return reply.code or 0
+
+
+def _ensure_isolated() -> None:
+    """Called when `main()` is the process's own entry point. Togi runs in an isolated interpreter (`python -I`: no
+    current directory, no PYTHON* variables; see paths.isolated_argv). Started any other way (a pip console script,
+    `python -c`), restart through the launcher before doing anything; if that is impossible carry on, and the human
+    gates (approvals.human_gate) refuse to run in an interpreter that is not isolated and not clean."""
+    if sys.flags.isolated or not sys.executable:
+        return
+    try:
+        os.execv(sys.executable, paths.isolated_argv(sys.argv[1:]))
+    except OSError:
+        pass
 
 
 def _scan_common(argv: list[str]) -> dict:
@@ -495,15 +509,18 @@ def _decide(argv: list[str], decision: str) -> Reply:
         if st != "pending":
             raise TogiError("approval_not_pending", f"approval {rec['id']} is {st}, not pending",
                             next="togi approvals", status="refused")
+        # What is shown is what is signed: the pending file is the requester's, so an approval is re-derived from the
+        # live repo and the bundle's own command first (refusing on any mismatch) and THAT is displayed and signed.
+        verified = approvals.verify_pending(pos[0], rec) if decision == "approve" else None
         ttl = None
         if f["ttl"]:
             from .journal import parse_since
             import time
 
             ttl = max(1, int(time.time() - parse_since(f["ttl"])))
-        user = approvals.confirm_and_authenticate(approvals.prompt_lines_for(rec), rec["confirm_word"], decision,
-                                                  name)
-        rec = approvals.grant(rec["id"], decision, user, ttl, expect_hash=rec["args_hash"])
+        word = verified["confirm_word"] if verified else approvals.confirm_word_for_denial(rec)
+        user = approvals.confirm_and_authenticate(approvals.prompt_lines_for(rec, verified), word, decision, name)
+        rec = approvals.grant(rec["id"], decision, user, ttl, expect_hash=rec["args_hash"], verified=verified)
     except TogiError as e:
         _host_journal(name, False, e.status, e.code)
         raise

@@ -20,8 +20,9 @@ from pathlib import Path
 
 from . import paths
 
-# `togi run`, `python -m togi run`, `togi --json run -`, `/path/to/togi --text run x.py`
-_RUN_CMD = re.compile(r"(?:(?:^|[\s/])togi|-m\s+togi)(?:\s+--?[A-Za-z][\w-]*(?:=\S+)?)*\s+run(?:\s|$)")
+# `togi run`, `python -m togi run`, `togi --json run -`, `/path/to/togi --text run x.py`,
+# `python3 -I /path/togi/_launch.py run -` (what the launcher and the host re-exec actually run)
+_RUN_CMD = re.compile(r"(?:(?:^|[\s/])togi|-m\s+togi|_launch\.py)(?:\s+--?[A-Za-z][\w-]*(?:=\S+)?)*\s+run(?:\s|$)")
 _PS = re.compile(r"^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]{8}\s+\d{4})\s+(.*)$")
 _ENV = {"LC_ALL": "C", "PATH": "/bin:/usr/bin:/usr/sbin:/sbin"}
 _registered: Path | None = None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -38,6 +39,8 @@ class Manifest:
     run_env: list[str] = field(default_factory=list)      # [policy].run_env: env vars the `togi run` host keeps
     apply_driver: str = "claude"                           # [policy].apply_driver: minimum driver for `togi apply`
     apply_runs: int = 3                                    # [policy].apply_runs: minimum runs for `togi apply`
+    test_approvals: bool = False                           # [policy].test_approvals: accept test-scope (throwaway-approver) grants
+    require_lock: bool | None = None                       # [policy].require_lock: None = default (see lock_required)
     raw: dict = field(default_factory=dict)
 
     @property
@@ -51,6 +54,13 @@ class Manifest:
     @property
     def module_attr(self) -> str:
         return self.module.split(":")[1] if ":" in self.module else "bundle"
+
+    def lock_required(self) -> bool:
+        """Must a money command see a verified lock (`.togi/locked.sha256`, anchored in the audit log) before it runs?
+        `[policy] require_lock` says so explicitly; absent, it is true for a bundle that has locked tiers of its own
+        (`[tiers].locked` is not empty) and false for one that has none. A lock file that EXISTS must always verify,
+        whatever this says: it only decides whether a bundle may run money commands with no lock file at all."""
+        return bool(self.locked) if self.require_lock is None else self.require_lock
 
     def gated_effects(self) -> set[str]:
         """Effects that need a human approval. `money` is always gated."""
@@ -136,6 +146,8 @@ def load_manifest(repo: str | Path) -> Manifest:
         run_env=_run_env(policy, path),
         apply_driver=_apply_driver(policy, path),
         apply_runs=_apply_runs(policy, path),
+        test_approvals=_policy_bool(policy, "test_approvals", False, path),
+        require_lock=_policy_bool(policy, "require_lock", None, path),
         raw=raw,
     )
 
@@ -149,6 +161,16 @@ def _run_env(policy: dict, path) -> list[str]:
     if bad:
         raise ManifestError(f"{path}: [policy].run_env has invalid variable name(s): {', '.join(bad)}")
     return list(dict.fromkeys(names))
+
+
+def _policy_bool(policy: dict, key: str, default, path):
+    """A [policy] switch must be a real TOML boolean: "true" (a string) or 1 is a typo, not consent."""
+    if key not in policy:
+        return default
+    v = policy[key]
+    if not isinstance(v, bool):
+        raise ManifestError(f"{path}: [policy].{key} must be true or false")
+    return v
 
 
 def _apply_driver(policy: dict, path) -> str:
@@ -240,6 +262,20 @@ def walk_files(repo: Path):
             yield full.relative_to(repo).as_posix()
 
 
+def walk_symlinks(repo: Path):
+    """Yield (repo-relative posix path, is_directory) of every symlink (to a file, a directory, or nothing), with the
+    same exclusions as `walk_files`. `os.walk` lists a symlinked directory among `dirnames` without descending into
+    it, so this is the only place a link standing where a locked directory or file should be shows up."""
+    import os
+
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.endswith(".egg-info"))
+        for name in [*dirnames, *sorted(filenames)]:
+            full = Path(dirpath) / name
+            if full.is_symlink():
+                yield full.relative_to(repo).as_posix(), full.is_dir()
+
+
 # --------------------------------------------------------------------------- locked files (shared helpers)
 
 _VOLATILE = (".togi", ".git")   # audit log / lock file / VCS: never part of the locked hash set
@@ -254,8 +290,11 @@ def file_sha256(path: Path) -> str:
 
 
 def locked_files(repo: Path, man: Manifest) -> list[str]:
-    """Repo files covered by a locked pattern. A file whose NAME cannot be judged (control characters, line
-    separators) is treated as locked, so planting one under a locked directory is detected."""
+    """Repo files covered by a locked pattern, PLUS any symlink standing where locked content is (`locked_symlinks`): a
+    link is never skipped, because locked code reached through a link nobody hashed is the hole this list exists to close.
+    Callers that hash files must treat the links separately (`write_lock` refuses them, `verify_locked` fails on them).
+    A file whose NAME cannot be judged (control characters, line separators) is treated as locked, so planting one under a
+    locked directory is detected."""
     pats = [p for p in man.locked_patterns() if not p.startswith(_VOLATILE)]
     out = []
     for rel in walk_files(repo):
@@ -266,16 +305,55 @@ def locked_files(repo: Path, man: Manifest) -> list[str]:
             continue
         if any(glob_match(p, norm) for p in pats):
             out.append(rel)
+    out.extend(rel for rel in locked_symlinks(repo, man) if rel not in out)
     return out
+
+
+def _literal_prefix(pattern: str) -> str:
+    pat = pattern.strip()
+    if pat.startswith("./"):
+        pat = pat[2:]
+    cut = min([i for i in (pat.find(c) for c in "*?[") if i >= 0] or [len(pat)])
+    return fold(pat[:cut])
+
+
+def locked_symlinks(repo: Path, man: Manifest) -> list[str]:
+    """Symlinks that stand where locked content is, or could hide it: a link whose own path matches a locked
+    pattern (`src/closure/evil.py -> /tmp/x.py` is importable as locked code but is not hashed), a link to a
+    directory under a locked directory, and a link to a directory that replaces an ancestor of a locked file (a
+    symlinked `src` hides everything below it from the walk). Such a link makes the lock fail (`verify_locked`) and
+    is refused for `togi lock`, so locked code can never be reached through a path nobody hashed."""
+    pats = [p for p in man.locked_patterns() if not p.startswith(_VOLATILE)]
+    out = []
+    for rel, is_dir in walk_symlinks(repo):
+        try:
+            norm = normalize_relpath(rel)
+        except PathRejected:
+            out.append(rel)
+            continue
+        probes = [norm, norm + "/"] if is_dir else [norm]
+        hit = any(glob_match(p, x) for p in pats for x in probes)
+        if not hit and is_dir:
+            hit = any(_literal_prefix(p).startswith(fold(norm) + "/") for p in pats)
+        if hit:
+            out.append(rel)
+    return sorted(out)
 
 
 def locked_digest(repo: Path, man: Manifest) -> str:
     """One digest over the CURRENT contents of every locked file (not the recorded .togi/locked.sha256), so
-    anything bound to it (an approval) dies when locked code changes."""
+    anything bound to it (an approval) dies when locked code changes. Locked symlinks are part of it too (a link
+    appearing under a locked pattern changes the digest)."""
     lines = []
-    for rel in sorted(locked_files(repo, man)):
+    links = set(locked_symlinks(repo, man))
+    for rel in sorted(f for f in locked_files(repo, man) if f not in links):
         try:
             lines.append(f"{file_sha256(repo / rel)}  {rel!r}")
         except OSError:
             lines.append(f"unreadable  {rel!r}")
+    for rel in sorted(links):
+        try:
+            lines.append(f"symlink  {rel!r} -> {os.readlink(repo / rel)!r}")
+        except OSError:
+            lines.append(f"symlink  {rel!r}")
     return hashlib.sha256("\n".join(lines).encode("utf-8", "surrogatepass")).hexdigest()

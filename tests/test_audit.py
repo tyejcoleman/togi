@@ -303,8 +303,10 @@ def test_key_is_created_0600_and_a_damaged_key_is_an_error_not_a_new_key(notes, 
     assert k.read_text() == "zz not hex"
 
 
-def test_legacy_unsigned_log_and_head_still_verify_and_the_next_append_signs(notes, home):
-    """A log written before signatures existed (e.g. Crowd's real one) keeps verifying; new entries are signed."""
+def test_legacy_unsigned_log_and_head_still_verify_and_a_persons_lock_signs_the_next_entry(notes, home):
+    """A log written before signatures existed (e.g. Crowd's real one) keeps verifying, but an ordinary writer can no
+    longer append to it (L1: nothing proves an all-unsigned log was not rewritten); a person's `togi lock` can, and from
+    then on new entries are signed."""
     p = notes / ".togi" / "audit.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
     prev, ls = "0" * 64, []
@@ -321,7 +323,11 @@ def test_legacy_unsigned_log_and_head_still_verify_and_the_next_append_signs(not
     hp.write_text(json.dumps({"seq": 3, "hash": prev}))                 # the old head format: no mac
     v = audit.verify(notes, "notes")
     assert v["ok"] and v["authenticated"] is False and v["unauthenticated_entries"] == 3
-    add_entries(notes, 1)
+    with pytest.raises(Exception) as ex:
+        add_entries(notes, 1)                                          # an ordinary writer: refused, nothing written
+    assert ex.value.code == "audit_unauthenticated" and len(audit.read(notes)) == 3
+    audit.append(notes, "notes", action="lock", proposal=None, tier="locked", files=[], diff_sha256=None,
+                 stone_before=None, stone_after=None, decided_by="human:x", reason="re-anchor", anchor=True)
     es = audit.read(notes)
     assert "mac" not in es[0] and "mac" in es[3]
     v = audit.verify(notes, "notes")

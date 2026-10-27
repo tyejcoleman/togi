@@ -7,7 +7,7 @@ import pytest
 
 from togi import journal
 
-from conftest import togi, togi_code
+from conftest import lock_bundle, togi, togi_code
 
 KEYS = {"ts", "session", "agent", "surface", "bundle", "command", "args_shape", "args_hash", "ok", "status",
         "error_code", "duration_ms", "out_bytes", "out_tokens_est", "retry_of"}
@@ -95,7 +95,8 @@ def test_friction_summary(notes, home):
     assert by_cmd["show"]["calls"] == 2 and by_cmd["show"]["errors"] == 2 and by_cmd["show"]["error_rate"] == 1.0
     assert {"code": "note_not_found", "count": 2} in f["top_error_codes"]
     assert f["repeated_retries"] == [{"command": "show", "count": 2}] or f["repeated_retries"][0]["command"] == "show"
-    assert {"command": "show", "flag": "--idd", "count": 1} in f["unknown_flags"]
+    # an unknown flag NAME is hashed (a name can be a value in disguise); `near` is the real flag it resembles
+    assert {"command": "show", "flag": "--" + journal.flag_name_shape("idd"), "count": 1, "near": "--id"} in f["unknown_flags"]
     assert f["unknown_commands"] == [{"attempted": "shw", "count": 1}]
     assert f["help_lookups"] == [{"command": "tip send", "count": 1}]
     assert f["truncated_outputs"] == [{"command": "list", "count": 1}]
@@ -114,6 +115,7 @@ def test_raw_journal_and_since(notes, home):
 
 
 def test_args_shape_for_json_surface_types(notes, home):
+    lock_bundle("notes")
     togi("notes", "tip", "send", "--id", "n_1", "--amount", "1.5", expect=3)
     last = lines(home)[-1]
     assert last["args_shape"] == {"id": "str", "amount": "decimal"} and last["effect"] == "money"
@@ -146,26 +148,42 @@ def test_a_misspelt_command_word_is_kept_because_it_is_the_friction_signal(notes
     assert fr["unknown_commands"] == [{"attempted": "tip sned", "count": 1}]
 
 
-def test_unknown_flag_records_keep_the_flag_name_but_not_its_value(notes, home):
+def test_unknown_flag_records_hash_the_flag_name_and_drop_its_value(notes, home):
+    """L5: a flag name nobody defined can be a value in disguise (`--sk-live-...`), so it is recorded as a hash."""
     togi_code("notes", "add", "--text", "x", "--sk-live-ZZZ99=hello-secret")
     togi_code("notes", "add", "--text", "x", "--verbos", "also-secret")
     togi_code("notes", "add", "--text", "x", "--" + "z" * 80 + "=v")
     ents = [l for l in lines(home) if l["event"] == "unknown_flag"]
-    assert [e["attempted"] for e in ents] == ["--sk-live-ZZZ99", "--verbos", "--<flag>"]    # names kept; no '=value'
+    want = ["--" + journal.flag_name_shape(n) for n in ("sk-live-ZZZ99", "verbos", "z" * 80)]
+    assert [e["attempted"] for e in ents] == want and all(w.startswith("--#") for w in want)
     raw = raw_journal(home)
-    assert "hello-secret" not in raw and "also-secret" not in raw and "zzzz" not in raw
+    for secret in ("hello-secret", "also-secret", "zzzz", "sk-live", "ZZZ99", "verbos"):
+        assert secret not in raw, secret
+    assert "--#" in raw
+
+
+def test_a_known_flag_keeps_its_name_in_the_journal(notes, home):
+    togi_code("notes", "add", "--text", "x", "--tag", "a", "--bogus-flag-zz")      # --tag is a real flag of `add`
+    ents = [l for l in lines(home) if l["event"] == "unknown_flag"]
+    assert [e["attempted"] for e in ents] == ["--" + journal.flag_name_shape("bogus-flag-zz")]
+    assert journal.flag_name_shape("tag", {"tag"}) == "tag" and journal.flag_name_shape("Tag", {"tag"}) == "Tag"
+    assert journal.flag_name_shape("limit") == "limit"                             # a host flag, known everywhere
+    assert journal.flag_name_shape("tag") != "tag"                                 # unknown to the host alone: hashed
 
 
 def test_friction_still_reports_unknown_flags(notes, home):
     togi_code("notes", "add", "--text", "x", "--tgs", "a")
     fr = journal.friction(lines(home))
-    assert fr["unknown_flags"] == [{"command": "add", "flag": "--tgs", "count": 1}]
+    assert fr["unknown_flags"] == [{"command": "add", "flag": "--" + journal.flag_name_shape("tgs"), "count": 1,
+                                    "near": "--tag"}]
 
 
 def test_shapes_unit():
+    h = lambda n: "--" + journal.flag_name_shape(n)       # noqa: E731
     assert journal.argv_shape(["ap_1", "--ttl", "15m", "--ttl=15m", "--n=5", "-h", "-5", "3.5"]) == [
-        "<str>", "--ttl", "<str>", "--ttl=<str>", "--n=<num>", "-<short>", "<num>", "<num>"]
-    assert journal.sanitize_attempt("--tag=SECRET") == "--tag"
+        "<str>", "--ttl", "<str>", "--ttl=<str>", h("n") + "=<num>", "-<short>", "<num>", "<num>"]
+    assert journal.sanitize_attempt("--tag=SECRET") == h("tag")                # unknown to the host alone: hashed
+    assert journal.sanitize_attempt("--tag=SECRET", known_flags={"tag"}) == "--tag"
     assert journal.sanitize_attempt("drop setle d_7f3a 5.00", {"drop", "settle"}) == "drop setle <str> <num>"
     assert journal.sanitize_attempt(None) is None
 
@@ -180,7 +198,8 @@ def test_human_only_commands_are_journaled_before_parsing_even_when_parsing_fail
     host = lines(home, "_host")
     attempts = [l for l in host if l["event"] == "host_attempt"]
     assert len(attempts) == 1 and attempts[0]["command"] == cmd and attempts[0]["status"] == "attempted"
-    assert attempts[0]["argv"] == ["<str>", "--no-such-flag", "--ttl", "<str>", "--also=<str>"]    # shape only
+    assert attempts[0]["argv"] == ["<str>", "--" + journal.flag_name_shape("no-such-flag"), "--ttl", "<str>",
+                                   "--" + journal.flag_name_shape("also") + "=<str>"]    # shape only
     assert "secretvalue123" not in raw_journal(home, "_host") and "99m" not in raw_journal(home, "_host")
 
 
@@ -188,7 +207,7 @@ def test_journaling_survives_leading_mode_flags_and_agent_sessions(notes, home, 
     monkeypatch.setenv("TOGI_AGENT", "stone")
     togi_code("--json", "approve", "--bogus")
     ents = [l for l in lines(home, "_host") if l["event"] == "host_attempt"]
-    assert ents and ents[0]["agent"] == "stone" and ents[0]["argv"] == ["--bogus"]
+    assert ents and ents[0]["agent"] == "stone" and ents[0]["argv"] == ["--" + journal.flag_name_shape("bogus")]
 
 
 def test_other_commands_do_not_write_attempt_records(notes, home):

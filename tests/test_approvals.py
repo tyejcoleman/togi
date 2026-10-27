@@ -11,14 +11,15 @@ import pytest
 
 from togi import approvals
 
-from conftest import (clean_env, PASSPHRASE, answers, human, run_in_pty, run_togi, throwaway_approver_home, togi,
-                      togi_code)
+from conftest import (clean_env, PASSPHRASE, answers, human, lock_bundle, run_in_pty, run_togi, throwaway_approver_home,
+                      togi, togi_code)
 
 TIP = ["notes", "tip", "send", "--id", "n_1", "--amount", "5.00"]
 
 
 @pytest.fixture
 def tipped(notes):
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     togi("notes", "add", "--text", "tip me")
     return notes
 
@@ -114,6 +115,7 @@ def test_approval_binds_to_command(tipped, home, notes_repo):
     # make admin gated too, so `delete` is a different gated command
     toml = notes_repo / "togi.toml"
     toml.write_text(toml.read_text().replace('approve_effects = ["money"]', 'approve_effects = ["money", "admin"]'))
+    lock_bundle("notes")     # togi.toml is locked: a person re-locks after editing it
     aid = request_approval()["approval"]["id"]
     assert human_approve(home, aid)[0] == 0
     code, out = togi_code("notes", "delete", "--id", "n_1", "--approval", aid)

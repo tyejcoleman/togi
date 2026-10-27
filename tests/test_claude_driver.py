@@ -57,7 +57,7 @@ def test_mcp_surface_command_uses_mcp_config(notes, home, fake_claude):
     args = seen["args"]
     cfg = json.loads(args[args.index("--mcp-config") + 1])
     assert cfg["mcpServers"]["togi"]["command"] == sys.executable
-    assert cfg["mcpServers"]["togi"]["args"] == ["-m", "togi", "mcp", "serve", "notes"]
+    assert cfg["mcpServers"]["togi"]["args"] == ["-I", str(stone.paths.launcher_path()), "mcp", "serve", "notes"]
     assert "--strict-mcp-config" in args and "--tools=" in args and "--allowedTools=mcp__togi,mcp__togi__*" in args
     assert "--safe-mode" not in args and args[args.index("--setting-sources") + 1] == ""
     prompt = args[args.index("--system-prompt") + 1]

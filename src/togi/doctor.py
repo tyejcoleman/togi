@@ -73,18 +73,25 @@ def check_bundle(name: str, path: str) -> list[dict]:
         rows.append(check(f"{name}: stone tasks", False, e.message, next=e.next))
     lock = audit.verify_locked(p, man)
     if not lock["locked_file_present"]:
-        rows.append(check(f"{name}: locked hashes", False, "no .togi/locked.sha256 (apply will refuse)", level="warn",
-                          next=f"togi lock {name}"))
+        needed = man.lock_required()
+        rows.append(check(f"{name}: locked hashes", not needed,
+                          "no .togi/locked.sha256: apply and this bundle's money commands are refused until it is locked"
+                          if needed else "no .togi/locked.sha256, and [policy] require_lock says this bundle needs none",
+                          level="warn", next=f"togi lock {name}"))
     else:
-        bad = lock["changed"] + lock["missing"] + lock["unlisted"]
+        bad = audit.lock_problems(lock) or [lock.get("problem", "the lock is not anchored in the signed audit log")]
         rows.append(check(f"{name}: locked hashes", lock["ok"],
                           f"{lock['files']} file(s) verified" if lock["ok"] else "differs: " + ", ".join(bad[:5]),
                           next=f"review the change, then: togi lock {name}"))
+    if man.test_approvals:
+        rows.append(check(f"{name}: test_approvals", False,
+                          "[policy] test_approvals = true: this bundle accepts grants from a throwaway (test-scope) "
+                          "approver, so its gated commands must check ctx.approval_scope", level="warn",
+                          next="remove test_approvals unless every gated command refuses test scope outside test mode"))
     chain = audit.verify(p, name)
     if chain["entries"] or chain["head"] != "none":
-        note = "" if chain["authenticated"] else (
-            f"; {chain['unauthenticated_entries']} older entr{'y' if chain['unauthenticated_entries'] == 1 else 'ies'} "
-            "not signed by this machine's key" if chain["unauthenticated_entries"] else "")
+        note = f"; {chain['unauthenticated_entries']} older entr{'y' if chain['unauthenticated_entries'] == 1 else 'ies'} " \
+               "not signed by this machine's key" if chain["unauthenticated_entries"] else ""
         rows.append(check(f"{name}: audit chain", chain["ok"],
                           f"{chain['entries']} entr{'y' if chain['entries'] == 1 else 'ies'} verified{note}" if chain["ok"]
                           else f"broken at seq {chain['problems'][0]['seq']}: {chain['problems'][0]['problem']}",

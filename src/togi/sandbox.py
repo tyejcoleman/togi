@@ -82,13 +82,49 @@ def python_roots() -> list[str]:
     return sorted({os.path.realpath(r) for r in roots if r})
 
 
+def site_dirs() -> list[str]:
+    """Directories where installed packages live (`purelib`, `platlib`, and any `site-packages` / `dist-packages` on
+    `sys.path`): readable by the child (it needs its interpreter's libraries), except for registered bundles' modules."""
+    out = {sysconfig.get_path(k) for k in ("purelib", "platlib")}
+    out |= {p for p in sys.path if p and os.path.basename(p) in ("site-packages", "dist-packages")}
+    return sorted({os.path.realpath(p) for p in out if p and os.path.isdir(p)})
+
+
+def installed_module_paths(modules, dirs: list[str] | None = None) -> list[str]:
+    """Paths inside the site directories that ARE the given top-level modules: the package directory or module file, an
+    extension module, dist/egg metadata (`crowd-0.1.dist-info`), `.pth`/`.egg-link` files and editable-install finders
+    (`__editable__.crowd-0.1.pth`, `__editable___crowd_0_1_finder.py`). Found by listing each directory, so nothing is
+    guessed about versions."""
+    found: set[str] = set()
+    for d in (site_dirs() if dirs is None else dirs):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for mod in modules:
+            for top in {mod, mod.replace("-", "_")}:
+                for name in names:
+                    if (name == top or name.startswith(top + ".")
+                            or (name.startswith(top + "-") and name.endswith((".dist-info", ".egg-info", ".egg-link", ".pth")))
+                            or name.startswith(("__editable__." + top, "__editable___" + top))):
+                        found.add(os.path.join(d, name))
+    return sorted(found)
+
+
 def build_profile(*, tmp: str, repos: list[str], togi_home: str, home: str, strict: bool = False,
-                  also_hidden: tuple[str, ...] = ()) -> str:
+                  also_hidden: tuple[str, ...] = (), modules=(), site: list[str] | None = None) -> str:
     """The SBPL profile text. All paths are resolved (the sandbox matches real paths, not symlinks). `also_hidden`
-    are further paths denied outright, e.g. a $TOGI_APPROVER_HOME that is not under the user's home."""
+    are further paths denied outright, e.g. a $TOGI_APPROVER_HOME that is not under the user's home.
+
+    `modules` are the top-level import names of the registered bundles. The Python install (including its
+    site-packages) must stay readable, but a bundle that is INSTALLED there (`pip install crowd`) would let a script
+    `import crowd.engine` and call it directly, past every guard; so the paths inside the site directories that are those
+    modules (package, metadata, editable-install finders) are denied last, like the registered repos. `site` overrides
+    the directories searched (tests); it is also added to the readable roots."""
     real = os.path.realpath
     tmp, togi_home, home = real(tmp), real(togi_home), real(home)
     hidden = sorted({real(r) for r in repos} | {togi_home} | {real(h) for h in also_hidden})
+    installed = sorted({real(m) for m in installed_module_paths(modules, site)})
     lines = [
         "(version 1)",
         "(allow default)",
@@ -104,9 +140,13 @@ def build_profile(*, tmp: str, repos: list[str], togi_home: str, home: str, stri
                   "(allow file-read* " + " ".join(f"(subpath {_q(z)})" for z in STRICT_READ) + ")"]
     else:
         lines.append("(deny file-read* " + " ".join(f"(subpath {_q(z)})" for z in (*DENY_READ_ZONES, home)) + ")")
-    lines += [f"(allow file-read* (subpath {_q(r)}))" for r in python_roots()]
+    lines += [f"(allow file-read* (subpath {_q(r)}))" for r in sorted({*python_roots(), *(real(d) for d in site or [])})]
     lines.append(f"(allow file-read* file-write* (subpath {_q(tmp)}))")
     lines.append("(deny file* " + " ".join(f"(subpath {_q(h)})" for h in hidden) + ")")
+    if installed:
+        # NOT `file*`: the Python install above is allowed with the specific `file-read*`, and a generic `file*` deny
+        # does not outrank a specific allow that came first. These paths sit INSIDE the allowed site-packages.
+        lines.append("(deny file-read* file-write* " + " ".join(f"(subpath {_q(h)})" for h in installed) + ")")
     return "\n".join(lines) + "\n"
 
 
@@ -126,7 +166,7 @@ def _trial(profile: str, tmp: str, home: str) -> tuple[bool, str]:
 
 
 def prepare(*, tmp: str, repos: list[str], togi_home: str, home: str,
-            also_hidden: tuple[str, ...] = ()) -> Sandbox:
+            also_hidden: tuple[str, ...] = (), modules=()) -> Sandbox:
     """Build the profile and prove (with a trial run of Python under it) that it works here: the strict profile
     first, then the standard one, else no sandbox (the caller reports `sandboxed: false` and why)."""
     ok, why = available()
@@ -136,7 +176,7 @@ def prepare(*, tmp: str, repos: list[str], togi_home: str, home: str,
     for strict in (True, False):
         try:
             profile = build_profile(tmp=tmp, repos=repos, togi_home=togi_home, home=home, strict=strict,
-                                    also_hidden=also_hidden)
+                                    also_hidden=also_hidden, modules=modules)
         except ValueError as e:
             return Sandbox(False, f"cannot build a sandbox profile: {e}")
         works, detail = _trial(profile, tmp, home)

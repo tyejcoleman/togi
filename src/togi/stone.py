@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import journal, paths
+from . import approvals, journal, paths
 from .cli import Reply, parse_flags, _mode, _usage
 from .errors import TogiError
 from .manifest import Manifest, load_manifest
@@ -137,9 +137,10 @@ class Sandbox:
             d.mkdir()
         (self.home / "bundles.toml").write_text(
             f"[bundles.{json.dumps(bundle)}]\npath = {json.dumps(str(repo))}\n", encoding="utf-8")
+        (self.root / approvals.SANDBOX_MARKER).write_text("a stone sandbox: see approvals.sandbox_optin\n")
         shim = self.bin / "togi"
-        shim.write_text(f'#!/bin/sh\nPYTHONPATH="{paths.src_dir()}${{PYTHONPATH:+:$PYTHONPATH}}" '
-                        f'exec "{sys.executable}" -m togi "$@"\n')
+        # the same isolated launch as bin/togi: python -I, Togi's src added by the launcher, no PYTHONPATH
+        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I "{paths.launcher_path()}" "$@"\n')
         shim.chmod(0o755)
         self.agent_session = f"stone-{secrets.token_hex(4)}"
         self.harness_session = f"harness-{secrets.token_hex(4)}"
@@ -150,6 +151,7 @@ class Sandbox:
         env["PATH"] = f"{self.bin}{os.pathsep}{env.get('PATH', '')}"
         env["TOGI_HOME"] = str(self.home)
         env["TOGI_APPROVER_HOME"] = str(self.approver_home)   # any grant made in here is scope "test"
+        env[approvals.SANDBOX_ENV] = str(self.root)           # this run, and only this run, may accept test grants
         env["TOGI_SESSION"] = self.agent_session if agent else self.harness_session
         if agent:
             env["TOGI_AGENT"] = "stone"
@@ -336,10 +338,10 @@ MCP_ISOLATION = ["--setting-sources", "", "--disable-slash-commands", "--strict-
 def mcp_config(sb: "Sandbox") -> dict:
     """The one MCP server the agent gets: this very Togi, serving the bundle, in the sandbox home."""
     env = {**sb.extra_env, "TOGI_HOME": str(sb.home), "TOGI_APPROVER_HOME": str(sb.approver_home),
-           "TOGI_AGENT": "stone", "TOGI_SESSION": sb.agent_session,
-           "PYTHONPATH": str(paths.src_dir()), "PYTHONDONTWRITEBYTECODE": "1"}
-    return {"mcpServers": {MCP_SERVER_KEY: {"command": sys.executable, "args": ["-m", "togi", "mcp", "serve", sb.bundle],
-                                           "env": env}}}
+           approvals.SANDBOX_ENV: str(sb.root), "TOGI_AGENT": "stone", "TOGI_SESSION": sb.agent_session,
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    argv = paths.isolated_argv(["mcp", "serve", sb.bundle])   # python -I _launch.py ...: no PYTHONPATH needed
+    return {"mcpServers": {MCP_SERVER_KEY: {"command": argv[0], "args": argv[1:], "env": env}}}
 
 
 def claude_command(model: str | None, surface: str, sb: "Sandbox", max_cost: float | None) -> list[str]:
@@ -482,11 +484,16 @@ def run_tests(repo: Path, man: Manifest, timeout: float = 900) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith("TOGI_") and k not in SECRET_ENV
            and k not in ("PYTEST_ADDOPTS", "PYTEST_CURRENT_TEST")}
     env.update(man.stone_env)
-    tmp_home = tempfile.mkdtemp(prefix="togi-tests-home-")
-    tmp_approver = tempfile.mkdtemp(prefix="togi-tests-approver-")   # the bundle's tests never see the real approver
+    # one throwaway root, laid out like a stone Sandbox (marker + home + approver): the bundle's own tests run in a
+    # stone sandbox too, so they may use test-scope approvals and have no lock to verify; they never see the real approver
+    root = tempfile.mkdtemp(prefix="togi-tests-")
+    tmp_home, tmp_approver = os.path.join(root, "home"), os.path.join(root, "approver")
+    os.mkdir(tmp_home)
+    Path(root, approvals.SANDBOX_MARKER).write_text("a stone sandbox: see approvals.sandbox_optin\n")
     env["PYTHONPATH"] = os.pathsep.join([str(repo / "src"), str(repo), str(paths.src_dir())])
     env["TOGI_HOME"] = tmp_home
     env["TOGI_APPROVER_HOME"] = tmp_approver
+    env[approvals.SANDBOX_ENV] = root
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(repo),
@@ -495,8 +502,7 @@ def run_tests(repo: Path, man: Manifest, timeout: float = 900) -> dict:
         return {"ran": True, "passed": 0, "failed": 0, "errors": 1, "skipped": 0, "total": 0, "ok": False,
                 "note": f"tests exceeded {timeout:g}s"}
     finally:
-        shutil.rmtree(tmp_home, ignore_errors=True)
-        shutil.rmtree(tmp_approver, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)
     counts = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
     tail = (p.stdout.strip().splitlines() or [""])[-1]
     for n, word in re.findall(r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)", tail):

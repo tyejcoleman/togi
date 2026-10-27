@@ -11,7 +11,7 @@ from togi import Bundle, Context, TogiError
 from togi.bundle import coerce_json
 from togi.errors import ArgError
 
-from conftest import togi, togi_code
+from conftest import lock_bundle, togi, togi_code
 
 
 # ----------------------------------------------------------------------------- decorator + type mapping
@@ -328,12 +328,14 @@ def test_dry_run_obeys_the_cap(notes):
 
 
 def test_needs_approval_envelope_obeys_the_cap(notes):
+    lock_bundle("notes")     # the money path needs a verified lock
     code, out = togi_code("notes", "tip", "send", "--id", "n_" + "9" * 30000, "--amount", "5.00")
     assert code == 3 and out["status"] == "needs_approval" and out["approval"]["id"].startswith("ap_")
     assert len(json.dumps(out, separators=(",", ":")).encode()) <= 8192
 
 
 def _flood_approvals(n=20):
+    lock_bundle("notes")
     for i in range(1, n + 1):
         togi("notes", "add", "--text", f"n{i}")
         togi_code("notes", "tip", "send", "--id", f"n_{i}", "--amount", f"{i}." + "9" * 250)

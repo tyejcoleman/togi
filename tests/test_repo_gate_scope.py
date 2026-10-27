@@ -389,6 +389,7 @@ def test_an_auto_polish_apply_needs_no_person_and_so_needs_no_default_approver(n
 def test_money_approvals_still_work_under_a_test_scope_approver(notes, home):
     """The restriction is for the repo-changing gates. A throwaway approver still approves money (the bundle decides
     what to do with the scope, ctx.approval_scope) and still sets itself up: that is how the tests and the stone work."""
+    lock_bundle("notes")                                                 # the money path needs a verified lock
     togi("notes", "add", "--text", "tip me")
     tip = ("notes", "tip", "send", "--id", "n_1", "--amount", "5.00")
     code, out = togi_code(*tip)

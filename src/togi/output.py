@@ -155,49 +155,96 @@ def _size(env: dict) -> int:
 
 def fit(env: dict, max_bytes: int, more_hint: Callable[[int | None], str] | None = None,
         start_offset: int = 0) -> tuple[dict, bool]:
-    """Shrink `env["data"]` until the serialised envelope is <= max_bytes. Returns (env, truncated)."""
+    """Shrink `env["data"]` until the serialised envelope is <= max_bytes. Returns (env, truncated).
+
+    A list loses its tail (the `more` hint says where to continue). Anything else, and a list whose first items are
+    themselves too big, is shrunk by `_shrink`: the largest list OR dict is halved (a dict keeps its first keys) until the
+    value fits, then long strings are cut, and as a last resort the value becomes a text preview of its JSON. The
+    envelope is always `truncated: true` with a `more` hint when anything was cut."""
     if _size(env) <= max_bytes:
         return env, False
     env = dict(env)
     data = env.get("data")
+    budget = max_bytes - 160
     truncated_offset = None
     if isinstance(data, list):
         lo, hi = 0, len(data)
         while lo < hi:  # largest prefix that fits
             mid = (lo + hi + 1) // 2
-            if _size({**env, "data": data[:mid]}) <= max_bytes - 160:
+            if _size({**env, "data": data[:mid]}) <= budget:
                 lo = mid
             else:
                 hi = mid - 1
         keep = max(lo, 1) if data else 0
         env["data"] = data[:keep]
         truncated_offset = start_offset + keep
-        if keep < len(data) and _size(env) > max_bytes:
-            env["data"] = _trim_strings(env["data"], 240)
+        if _size(env) > max_bytes:   # even the first item alone is too big (one long string, one wide dict)
+            env["data"] = _shrink(env["data"], env, budget)
     else:
-        work = data
-        for _ in range(40):
-            if _size({**env, "data": work}) <= max_bytes - 160:
-                break
-            work = _halve_largest_list(work)
-            if work is None:
-                break
-        else:
-            work = data
-        if work is None or _size({**env, "data": work}) > max_bytes - 160:
-            work = _trim_strings(_halve_all(data), 240)
-            if _size({**env, "data": work}) > max_bytes - 160:
-                work = _trim_strings(work, 80)
-        env["data"] = work
+        env["data"] = _shrink(data, env, budget)
     env["truncated"] = True
     env["more"] = more_hint(truncated_offset) if more_hint else "re-run with --full for everything"
     return env, True
 
 
+def _shrink(work: Any, env: dict, budget: int) -> Any:
+    """Make `work` small enough to sit in `env["data"]` within `budget` bytes, whatever its shape."""
+    def fits(v: Any) -> bool:
+        return _size({**env, "data": v}) <= budget
+
+    for _ in range(80):                 # halve the biggest list/dict until it fits
+        if fits(work):
+            return work
+        nxt = _halve_largest_container(work)
+        if nxt is None:
+            break
+        work = nxt
+    for limit in (240, 80, 24):         # then cut long strings
+        work = _trim_strings(work, limit)
+        if fits(work):
+            return work
+        for _ in range(80):
+            nxt = _halve_largest_container(work)
+            if nxt is None or fits(work):
+                break
+            work = nxt
+        if fits(work):
+            return work
+    text = dumps(work)                   # last resort: a text preview of the JSON (still flagged `truncated`)
+    room = max(budget - _size({**env, "data": ""}) - 40, 40)
+    return text[:room] + f"...[+{max(len(text) - room, 0)} chars]"
+
+
+def hard_cap(env: dict, max_bytes: int) -> dict:
+    """The final guarantee: whatever `env` holds, the result serialises to at most `max_bytes` (unless the bare
+    ok/status/error code alone cannot, which a slug-sized code never does). Keeps ok, status, the error code and as much
+    of the message and `next` as fits, a short preview of any data, `truncated: true` and a `more` hint."""
+    if _size(env) <= max_bytes:
+        return env
+    err = env.get("error") if isinstance(env.get("error"), dict) else {}
+    for limit in (600, 240, 80, 24):
+        out: dict[str, Any] = {"ok": bool(env.get("ok"))}
+        if "status" in env:
+            out["status"] = str(env["status"])[:40]
+        if err:
+            out["error"] = {"code": str(err.get("code", ""))[:80], "message": _trim_strings(str(err.get("message", "")), limit)}
+        if env.get("next"):
+            out["next"] = _trim_strings(str(env["next"]), limit)
+        if "data" in env and env["data"] is not None:
+            text = dumps(env["data"])
+            out["data"] = text[: limit * 2] + (f"...[+{len(text) - limit * 2} chars]" if len(text) > limit * 2 else "")
+        out["truncated"] = True
+        out["more"] = "output was cut to fit the size limit; re-run with --full for everything"
+        if _size(out) <= max_bytes:
+            return out
+    return {"ok": bool(env.get("ok")), "truncated": True, "more": "output cut; re-run with --full"}
+
+
 def fit_any(env: dict, max_bytes: int, more_hint: Callable[[int | None], str] | None = None) -> tuple[dict, bool]:
     """`fit` for every kind of envelope: success data is shrunk by `fit`; error envelopes, dry-run descriptions
     and anything else have their long strings cut (message, summary, args...) until the whole thing fits.
-    Always keeps ok/status/error.code, adds `truncated: true` and a `more` hint."""
+    Always keeps ok/status/error.code, adds `truncated: true` and a `more` hint, and ends in `hard_cap`: the
+    serialised result is never larger than `max_bytes`."""
     if _size(env) <= max_bytes:
         return env, False
     if env.get("ok") or isinstance(env.get("data"), (list, dict)):
@@ -214,7 +261,7 @@ def fit_any(env: dict, max_bytes: int, more_hint: Callable[[int | None], str] | 
         out = {k: out[k] for k in ("ok", "status", "error", "next") if k in out}
     out["truncated"] = True
     out.setdefault("more", more_hint(None) if more_hint else "re-run with --full for everything")
-    return out, True
+    return hard_cap(out, max_bytes), True
 
 
 def cap_text(text: str, max_bytes: int) -> str:
@@ -231,35 +278,44 @@ def cap_text(text: str, max_bytes: int) -> str:
     return head.rstrip("\n") + footer
 
 
-def _halve_largest_list(obj: Any) -> Any:
-    path = _largest_list_path(obj, ())
+def _halve_largest_container(obj: Any) -> Any:
+    """Halve the biggest list or dict inside `obj` (a dict keeps its first keys). None if nothing can be halved."""
+    path = _largest_container_path(obj, ())
     if path is None:
         return None
-    return _replace_at(obj, path[0], lambda lst: lst[: max(1, len(lst) // 2)])
+    return _replace_at(obj, path[0], _halve)
 
 
-def _halve_all(obj: Any) -> Any:
-    if isinstance(obj, list):
-        return [_halve_all(i) for i in obj[: max(1, min(len(obj), 5))]]
+def _halve(c: Any) -> Any:
+    if isinstance(c, dict):
+        return dict(list(c.items())[: max(1, len(c) // 2)])
+    return c[: max(1, len(c) // 2)]
+
+
+def _mass(obj: Any) -> int:
+    """How much halving this container would save: a list counts its whole size, a dict only its OWN keys and values (the
+    containers inside it are weighed on their own), so a wide dict is cut before the small lists and dicts beside it."""
+    total = len(dumps(obj))
     if isinstance(obj, dict):
-        return {k: _halve_all(v) for k, v in obj.items()}
-    return obj
+        total -= sum(len(dumps(v)) for v in obj.values() if isinstance(v, (list, dict)))
+    return total
 
 
-def _largest_list_path(obj: Any, path: tuple) -> tuple[tuple, int] | None:
+def _largest_container_path(obj: Any, path: tuple) -> tuple[tuple, int] | None:
     best = None
+    if isinstance(obj, (list, dict)) and len(obj) > 1:
+        best = (path, _mass(obj))
     if isinstance(obj, list):
-        if len(obj) > 1:
-            best = (path, len(dumps(obj)))
         for i, item in enumerate(obj[:3]):
-            sub = _largest_list_path(item, path + (i,))
+            sub = _largest_container_path(item, path + (i,))
             if sub and (best is None or sub[1] > best[1]):
                 best = sub
     elif isinstance(obj, dict):
-        for k, v in obj.items():
-            sub = _largest_list_path(v, path + (k,))
-            if sub and (best is None or sub[1] > best[1]):
-                best = sub
+        for k, v in list(obj.items())[:200]:
+            if isinstance(v, (list, dict)):
+                sub = _largest_container_path(v, path + (k,))
+                if sub and (best is None or sub[1] > best[1]):
+                    best = sub
     return best
 
 

@@ -47,6 +47,8 @@ DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_OUTPUT = 8192
 FULL_MAX_OUTPUT = 1_000_000
 STDERR_CAP = 4096
+MAX_LINE = 1_000_000          # one JSON request line from the child; more than this and the child is stopped
+MAX_MESSAGE = 1000            # a child's error message, as the host reports it
 
 
 @dataclass
@@ -90,6 +92,8 @@ def scrubbed_env(tmpdir: str) -> dict[str, str]:
     }
     if paths.approver_override() is not None:   # a nested `togi` must use the same (throwaway) approver as the host
         env["TOGI_APPROVER_HOME"] = str(paths.approver_override())
+    if os.environ.get("TOGI_STONE_SANDBOX"):    # a nested `togi` in a stone sandbox run is still in that sandbox
+        env["TOGI_STONE_SANDBOX"] = os.environ["TOGI_STONE_SANDBOX"]
     if paths.is_agent():
         env["TOGI_AGENT"] = os.environ["TOGI_AGENT"]
     return env
@@ -117,15 +121,13 @@ def manifest_run_env() -> list[str]:
 
 def host_environment(environ: dict[str, str], run_env: list[str]) -> tuple[dict[str, str], dict[str, str]]:
     """(environment for the re-exec'd host, values to hand over out of band). The first holds only the
-    allowlist -- PATH, HOME, TMPDIR, LANG, LC_*, TOGI_* -- plus PYTHONPATH when a manifest lists it; the second
-    holds the other `run_env` variables, so they never sit in a process-visible environment."""
+    allowlist -- PATH, HOME, TMPDIR, LANG, LC_*, TOGI_* -- and never a PYTHON* variable: the host is started isolated
+    (`python -I`, which ignores them) and finds Togi through the launcher, not PYTHONPATH, so even a manifest that lists
+    PYTHONPATH in `run_env` cannot carry it in. The second holds the other `run_env` variables, so they never sit in a
+    process-visible environment."""
     env = {k: v for k, v in environ.items()
            if k in HOST_ENV_ALLOW or k.startswith("LC_") or k.startswith("TOGI_")}
-    oob = {k: environ[k] for k in run_env if k in environ and k not in env and k != "PYTHONPATH"}
-    pythonpath = [str(paths.src_dir())]
-    if "PYTHONPATH" in run_env and environ.get("PYTHONPATH"):
-        pythonpath.append(environ["PYTHONPATH"])
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    oob = {k: environ[k] for k in run_env if k in environ and k not in env and not k.startswith("PYTHON")}
     return env, oob
 
 
@@ -171,10 +173,28 @@ def reexec_scrubbed() -> bool:
     elif blob:    # too large for a pipe buffer: keep them in the environment rather than lose them
         env.update(oob)
     try:
-        os.execve(sys.executable, [sys.executable, "-m", "togi", *cli.ENTRY_ARGV], env)
+        os.execve(sys.executable, paths.isolated_argv(cli.ENTRY_ARGV), env)   # python -I _launch.py ...: see paths.py
     except OSError:
         return False
     return False  # pragma: no cover  (execve does not return)
+
+
+def bundle_modules() -> list[str]:
+    """Top-level import names of every registered bundle (`crowd` for `crowd.togi_bundle:bundle`). The sandbox hides
+    these from the child even where they are INSTALLED (site-packages), so a script cannot import a bundle's engine."""
+    from .manifest import ManifestError, load_manifest
+
+    names: list[str] = []
+    try:
+        ents = registry.entries()
+    except TogiError:
+        return names
+    for ent in ents.values():
+        try:
+            names.append(load_manifest(ent.path).module_name.split(".")[0])
+        except (ManifestError, OSError):
+            continue
+    return sorted(set(n for n in names if n))
 
 
 def describe_bundle(name: str) -> dict:
@@ -233,7 +253,8 @@ def execute_script(source: str, *, timeout: float = DEFAULT_TIMEOUT, max_output:
         shutil.copyfile(Path(__file__).with_name("_runchild.py"), child_py)
         shutil.copyfile(Path(__file__).with_name("errors.py"), errors_py)
         sb = (sandbox.prepare(tmp=tmp, repos=[e.path for e in entries.values()], togi_home=str(paths.togi_home()),
-                              home=os.path.expanduser("~"), also_hidden=_approver_hidden())
+                              home=os.path.expanduser("~"), also_hidden=_approver_hidden(),
+                              modules=bundle_modules())
               if use_sandbox
               else sandbox.Sandbox(False, "sandbox disabled by the caller"))
         out.sandboxed, out.sandbox_reason, out.sandbox_level = sb.sandboxed, sb.reason or sb.note, sb.level
@@ -276,7 +297,14 @@ def execute_script(source: str, *, timeout: float = DEFAULT_TIMEOUT, max_output:
                     state["buf"] += data
                     while b"\n" in state["buf"]:
                         line, state["buf"] = state["buf"].split(b"\n", 1)
+                        if len(line) > MAX_LINE:
+                            _protocol_abort(out, proc, f"a request line of {len(line)} bytes (the limit is {MAX_LINE})")
+                            state["buf"] = b""
+                            break
                         _handle(line, parent_sock, session, out)
+                    if len(state["buf"]) > MAX_LINE:   # no newline in sight: stop buffering it
+                        _protocol_abort(out, proc, f"more than {MAX_LINE} bytes without a line end")
+                        state["buf"] = b""
                 else:
                     chunk = os.read(key.fileobj.fileno(), 65536)
                     if not chunk:
@@ -322,6 +350,21 @@ def execute_script(source: str, *, timeout: float = DEFAULT_TIMEOUT, max_output:
     return out
 
 
+def _protocol_abort(out: RunOutcome, proc, why: str) -> None:
+    """The child sent something the host will not buffer: stop it, and report that instead of its output."""
+    out.fatal = {"op": "fatal", "kind": "exception", "code": "protocol_error",
+                 "message": f"the script sent {why}; it was stopped"}
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _cut(text: object, limit: int = MAX_MESSAGE) -> str:
+    s = text if isinstance(text, str) else str(text)
+    return s if len(s) <= limit else s[:limit] + f"...[+{len(s) - limit} chars]"
+
+
 def _handle(line: bytes, sock: socket.socket, session: str, out: RunOutcome) -> None:
     try:
         msg = json.loads(line.decode("utf-8"))
@@ -329,6 +372,14 @@ def _handle(line: bytes, sock: socket.socket, session: str, out: RunOutcome) -> 
         return
     op = msg.get("op")
     if op == "fatal":
+        # whatever the script says about its own failure is bounded before it is kept: a 200 KB exception message must not
+        # reach the caller's stderr
+        for k in ("message", "next", "code"):
+            if isinstance(msg.get(k), str):
+                msg[k] = _cut(msg[k])
+        if isinstance(msg.get("approval"), dict):
+            msg["approval"] = {k: (_cut(v) if isinstance(v, str) else v) for k, v in msg["approval"].items()
+                               if k in ("id", "command", "summary", "expires")}
         out.fatal = msg
         return
     if op == "describe":
@@ -394,7 +445,7 @@ def h_run(argv: list[str]) -> Reply:
     if res.stderr.strip() and not (res.fatal and res.fatal.get("kind") in ("togi_error", "needs_approval")):
         sys.stderr.write(res.stderr if res.stderr.endswith("\n") else res.stderr + "\n")
     if not env.get("ok"):
-        sys.stderr.write(output.dumps(env) + "\n")
+        sys.stderr.write(output.dumps(output.hard_cap(env, output.MAX_BYTES)) + "\n")
     sys.stderr.flush()
     return Reply(code=res.exit_code, silent=True)
 
@@ -408,11 +459,12 @@ def _final_envelope(res: RunOutcome, timeout: float, cap: int) -> dict:
         return output.ok_envelope(None)
     if fatal.get("kind") == "needs_approval":
         appr = fatal.get("approval") or (res.approvals[-1] if res.approvals else None)
-        return output.error_envelope("needs_approval", "needs_approval", fatal.get("message") or "approval needed",
-                                     next=fatal.get("next"), approval=appr)
+        return output.error_envelope("needs_approval", "needs_approval", _cut(fatal.get("message") or "approval needed"),
+                                     next=_cut(fatal.get("next")) if fatal.get("next") else None, approval=appr)
     if fatal.get("kind") == "togi_error":
-        return output.error_envelope(fatal.get("status", "error"), fatal.get("code", "error"),
-                                     fatal.get("message", ""), next=fatal.get("next"))
-    msg = fatal.get("message") or (res.stderr.strip().splitlines() or ["the script failed"])[-1]
-    return output.error_envelope("error", fatal.get("code", "script_error"), msg,
+        return output.error_envelope(_cut(fatal.get("status", "error"), 20), _cut(fatal.get("code", "error"), 80),
+                                     _cut(fatal.get("message", "")),
+                                     next=_cut(fatal.get("next")) if fatal.get("next") else None)
+    msg = _cut(fatal.get("message") or (res.stderr.strip().splitlines() or ["the script failed"])[-1])
+    return output.error_envelope("error", _cut(fatal.get("code", "script_error"), 80), msg,
                                  next="fix the script and re-run: togi run <script>")

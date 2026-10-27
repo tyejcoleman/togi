@@ -42,7 +42,7 @@ from . import output, paths
 from .cli import Reply, parse_flags, _mode, _usage
 from .errors import TogiError
 from .journal import now_ts
-from .manifest import Manifest, file_sha256, locked_files, walk_files  # noqa: F401  (re-exported)
+from .manifest import Manifest, file_sha256, locked_files, locked_symlinks, walk_files  # noqa: F401  (re-exported)
 from .pathnorm import escape_text
 
 GENESIS = "0" * 64
@@ -212,8 +212,11 @@ def check_entries(entries: list[dict], key: bytes | None) -> tuple[list[dict], d
     if key is None and any_signed:
         problems.append(_problem(None, "key", f"entries are signed but {paths.audit_key_path()} does not exist, so "
                                               "they cannot be authenticated"))
-    info = {"authenticated": bool(entries) and key is not None and last_local == len(entries) and n_unauth == 0
-            and not problems, "unauthenticated": n_unauth, "signed": last_local > 0}
+    # "authenticated": this machine's key vouches for the log. At least one entry is signed by it and (checked above)
+    # every entry after the first signed one is too; an unsigned PREFIX (a log older than signatures) is allowed and
+    # counted in `unauthenticated`. A log with no signed entry at all is chain-bound only, never authenticated.
+    info = {"authenticated": bool(entries) and key is not None and last_local > 0 and not problems,
+            "unauthenticated": n_unauth, "signed": last_local > 0}
     return problems, info
 
 
@@ -309,6 +312,13 @@ def append(repo: Path, bundle: str, *, action: str, proposal: str | None, tier: 
                         next=f"restore {paths.audit_key_path()}, or a person re-anchors the log with: "
                              f"togi lock {bundle}", status="refused")
                 key = ensure_key()   # first use (or a human re-anchoring): start the trust root
+            if entries and not anchor and not any("mac" in e for e in entries if isinstance(e, dict)):
+                raise TogiError(
+                    "audit_unauthenticated",
+                    f"refusing to write: the audit log has {len(entries)} entr{'y' if len(entries) == 1 else 'ies'} "
+                    "and none is signed (it predates signatures), so nothing here proves it was not rewritten. "
+                    "Nothing was written.",
+                    next=f"a person re-anchors it, after reading it, with: togi lock {bundle}", status="refused")
             kid = key_id(key)
             v = verify_state(entries, key, bundle)
             bad = v["problems"]
@@ -357,7 +367,14 @@ def _write_head(bundle: str, entry: dict, key: bytes) -> None:
 
 
 def write_lock(repo: Path, man: Manifest) -> list[str]:
-    files = sorted(locked_files(repo, man))
+    links = locked_symlinks(repo, man)
+    if links:   # a link standing where locked code is would be reachable but never hashed
+        raise TogiError("locked_symlink", "symlink(s) stand under the locked patterns, so the locked files cannot be "
+                        "pinned: " + ", ".join(escape_text(x, 120) for x in links[:5]),
+                        next="replace each link with the real file or remove it, then run: togi lock " + man.name,
+                        status="refused")
+    linkset = set(links)
+    files = sorted(f for f in locked_files(repo, man) if f not in linkset)
     for rel in files:  # a name with a newline/separator would forge extra lines in the lock file
         if escape_text(rel) != rel or "\n" in rel:
             raise TogiError("unsafe_file_name", f"locked file name {escape_text(rel)!r} has control characters",
@@ -387,28 +404,88 @@ def verify_locked(repo: Path, man: Manifest) -> dict:
         elif file_sha256(f) != h:
             changed.append(rel)
     unlisted = sorted(set(locked_files(repo, man)) - set(recorded))
+    links = locked_symlinks(repo, man)
     anchored, anchor_problem = lock_anchored(repo, lp)
-    ok = not (changed or missing or unlisted) and anchored
+    ok = not (changed or missing or unlisted or links) and anchored
     out = {"ok": ok, "locked_file_present": True, "files": len(recorded), "changed": sorted(changed),
-           "missing": sorted(missing), "unlisted": [escape_text(u, 120) for u in unlisted], "anchored": anchored}
+           "missing": sorted(missing), "unlisted": [escape_text(u, 120) for u in unlisted],
+           "symlinks": [escape_text(x, 120) for x in links], "anchored": anchored}
     if anchor_problem:
         out["problem"] = anchor_problem
     return out
 
 
+def lock_problems(v: dict) -> list[str]:
+    """The files (or links) a failed `verify_locked` result names, for messages."""
+    return list(dict.fromkeys(v.get("changed", []) + v.get("missing", []) + v.get("unlisted", [])
+                              + v.get("symlinks", [])))
+
+
 def lock_anchored(repo: Path, lp: Path) -> tuple[bool, str | None]:
-    """The lock file is only trusted if it is exactly the one the latest signed `lock` audit entry recorded.
-    Otherwise anyone who can write the repo could edit a locked file and rewrite the hash list by hand."""
+    """The lock file is only trusted if it is exactly the one the latest `lock` audit entry recorded, AND that entry is
+    genuine: its hash matches its content and it carries this machine's key id and a valid mac. Otherwise anyone who
+    can write the repo could edit a locked file, rewrite the hash list by hand and append a `lock` line saying so."""
     try:
         entries = read(repo)
-    except Exception as e:  # an unreadable log can't vouch for anything
-        return False, f"audit log unreadable: {type(e).__name__}"
+        key = load_key()
+    except Exception as e:  # an unreadable log or key can't vouch for anything
+        return False, f"audit log or key unreadable: {type(e).__name__}"
     locks = [e for e in entries if e.get("action") == "lock"]
     if not locks:
         return False, ".togi/locked.sha256 is not recorded by any `lock` entry in the audit log"
-    if locks[-1].get("diff_sha256") != sha256_text(_read_text(lp)):
+    last = locks[-1]
+    if key is None:
+        return False, f"there is no audit key ({paths.audit_key_path()}) to check the latest `lock` entry's signature with"
+    h = last.get("hash")
+    if (last.get("kid") != key_id(key) or not isinstance(h, str) or entry_hash(last) != h
+            or not isinstance(last.get("mac"), str) or not hmac.compare_digest(last["mac"], entry_mac(key, h))):
+        return False, "the latest `lock` entry in the audit log is not signed by this machine's audit key"
+    if last.get("diff_sha256") != sha256_text(_read_text(lp)):
         return False, ".togi/locked.sha256 differs from the one the latest signed `lock` entry recorded"
     return True, None
+
+
+def lock_state(repo: Path, man: Manifest) -> dict:
+    """The lock as the MONEY path and the approval prompt need it. `state` is one of
+      verified  the lock file exists, every locked file matches it, no link hides locked code, it is the one a signed
+                `lock` entry recorded, and the audit log itself verifies (chain, macs, head)
+      failed    a lock file exists and something is wrong (named in `detail`)
+      absent    no .togi/locked.sha256 (whether that is acceptable is the manifest's `require_lock`)"""
+    v = verify_locked(repo, man)
+    if not v["locked_file_present"]:
+        return {"state": "absent", "ok": False, "files": 0, "detail": "no .togi/locked.sha256"}
+    if not v["ok"]:
+        bad = lock_problems(v)[:5]
+        detail = ("locked files differ from the lock: " + ", ".join(bad)) if bad else v.get("problem", "not anchored")
+        return {"state": "failed", "ok": False, "files": v.get("files", 0), "detail": detail}
+    problem = chain_problem(repo, man.name)
+    if problem:
+        return {"state": "failed", "ok": False, "files": v.get("files", 0), "detail": problem[1]}
+    return {"state": "verified", "ok": True, "files": v.get("files", 0), "detail": f"{v.get('files', 0)} locked file(s) verified"}
+
+
+def chain_problem(repo: Path, bundle: str) -> tuple[str, str] | None:
+    """(code, message) if the audit log must not be relied on, else None. Requires the log to be intact AND
+    authenticated by this machine's key (an empty log has nothing to rely on and is fine)."""
+    v = verify(repo, bundle)
+    if not v["ok"]:
+        p0 = v["problems"][0]
+        return "audit_chain_broken", f"the audit log is broken at seq {p0['seq']}: {p0['problem']}"
+    if v["entries"] and not v["authenticated"]:
+        return "audit_unauthenticated", (
+            f"the audit log ({v['entries']} entr{'y' if v['entries'] == 1 else 'ies'}) is not authenticated: no entry "
+            "is signed by this machine's audit key, so it could have been rewritten")
+    return None
+
+
+def require_trusted_chain(repo: Path, bundle: str, status: str = "error") -> None:
+    """For apply and revert: raise unless the audit log verifies AND is authenticated (`authenticated`, see
+    check_entries). The fix for an unsigned or foreign-signed log is a person's `togi lock`."""
+    problem = chain_problem(repo, bundle)
+    if problem:
+        code, msg = problem
+        raise TogiError(code, msg, next=f"togi log {bundle} --verify" if code == "audit_chain_broken"
+                        else f"a person reads the log, then re-anchors it with: togi lock {bundle}", status=status)
 
 
 def lock_bundle(man: Manifest, decided_by: str) -> dict:
@@ -451,6 +528,12 @@ def h_lock(argv: list[str]) -> Reply:
     approvals.human_repo_gate("lock")
     man = registry.manifest_for(pos[0])
     approvals.require_approver()
+    links = locked_symlinks(man.repo, man)
+    if links:    # say so before asking for anything: such a repo cannot be locked
+        raise TogiError("locked_symlink", "symlink(s) stand under the locked patterns, so the locked files cannot be "
+                        "pinned: " + ", ".join(escape_text(x, 120) for x in links[:5]),
+                        next="replace each link with the real file or remove it, then run: togi lock " + man.name,
+                        status="refused")
     n = len(locked_files(man.repo, man))
     lines = [f"Lock bundle {man.name}  ({escape_text(man.repo)})",
              f"This records the sha256 of {n} locked file(s) in .togi/locked.sha256 and signs an audit entry.",

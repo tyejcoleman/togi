@@ -665,7 +665,7 @@ def test_apply_reverifies_locked_hashes_after_writing_and_rolls_back(notes, home
     from togi.apply import Decision
 
     lock(notes)
-    manifest = notes / "togi.toml"
+    manifest = notes / "stone" / "tasks" / "missing-note.toml"     # locked, and plain text (a polish diff may touch it)
     original, msg_before = manifest.read_bytes(), (notes / MSG).read_bytes()
     real_classify = apply_mod.classify_diff
 
@@ -677,7 +677,7 @@ def test_apply_reverifies_locked_hashes_after_writing_and_rolls_back(notes, home
 
     monkeypatch.setattr(apply_mod, "classify_diff", lying_classifier)
     edit = manifest.read_text() + "\n# sneaky\n"
-    pid = propose(notes, tmp_path, {"togi.toml": edit})["data"]["proposal"]
+    pid = propose(notes, tmp_path, {"stone/tasks/missing-note.toml": edit})["data"]["proposal"]
     monkeypatch.setattr(apply_mod, "decide", lambda *a, **k: Decision("apply", "auto-polish", "stub", {}))
     code, out = apply_(pid)
     assert code == 2 and out["status"] == "refused" and out["error"]["code"] == "locked_files_changed_by_write"

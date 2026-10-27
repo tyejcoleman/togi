@@ -11,7 +11,7 @@ import pytest
 
 from togi import approvals
 
-from conftest import SRC, human, run_in_pty, run_togi, togi
+from conftest import SRC, human, lock_bundle, run_in_pty, run_togi, togi
 
 
 def run(home, script, *flags, env_extra=None, timeout=60):
@@ -59,6 +59,7 @@ def test_script_calls_bundle_functions_and_only_prints_come_back(notes, home):
 
 
 def test_calls_are_journaled_with_surface_run_and_guarded(notes, home):
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     r = run(home, "notes.add(text='a'); notes.find(query='a'); notes.tip_send(id='n_1', amount='1')")
     assert r.returncode == 3  # uncaught NeedsApproval
     calls = [l for l in journal_lines(home) if l["event"] == "call"]
@@ -122,6 +123,7 @@ def test_output_cap_and_full(notes, home):
 
 
 def test_money_call_raises_needs_approval_and_does_not_execute(notes, home):
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     r = run(home, """
         notes.add(text="tip me")
         try:
@@ -138,6 +140,7 @@ def test_money_call_raises_needs_approval_and_does_not_execute(notes, home):
 
 
 def test_uncaught_needs_approval_exits_3_with_envelope(notes, home):
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     r = run(home, "notes.add(text='x'); notes.tip_send(id='n_1', amount='5.00')")
     assert r.returncode == 3
     env = json.loads(r.stderr.strip().splitlines()[-1])
@@ -155,6 +158,7 @@ def _approve_from_script(home, aid):
 
 
 def test_approvals_cannot_be_granted_from_inside_run(notes, home):
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     togi("notes", "add", "--text", "x")
     aid = togi("notes", "tip", "send", "--id", "n_1", "--amount", "2", expect=3)["approval"]["id"]
     r = run(home, _approve_from_script(home, aid))
@@ -166,6 +170,7 @@ def test_approvals_cannot_be_granted_from_inside_run(notes, home):
 
 
 def test_approvals_cannot_be_granted_from_inside_an_unsandboxed_run(notes, home):
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     togi("notes", "add", "--text", "x")
     aid = togi("notes", "tip", "send", "--id", "n_1", "--amount", "2", expect=3)["approval"]["id"]
     r = run_unsandboxed(home, _approve_from_script(home, aid))
@@ -176,6 +181,7 @@ def test_approvals_cannot_be_granted_from_inside_an_unsandboxed_run(notes, home)
 
 
 def test_a_granted_approval_can_be_used_from_run_once(notes, home):
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     togi("notes", "add", "--text", "x")
     aid = togi("notes", "tip", "send", "--id", "n_1", "--amount", "2", expect=3)["approval"]["id"]
     assert human(home, ["approve", aid], "n_1")[0] == 0
@@ -191,6 +197,7 @@ def test_a_granted_approval_can_be_used_from_run_once(notes, home):
 
 
 def test_typed_api_positional_decimal_import_and_dry_run(notes, home):
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     from decimal import Decimal  # noqa: F401  (documented usage)
 
     r = run(home, """
@@ -307,6 +314,7 @@ def test_ancestry_check_stops_a_script_that_scrubs_togi_run_and_fakes_a_tty(note
     passphrase; the run registry still refuses, because a live `togi run` host is among `approve`'s ancestors.
     The host here is `python -c ...`: its command line does not look like `togi run`, so only the registry can
     be what catches it."""
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     from conftest import PASSPHRASE
 
     togi("notes", "add", "--text", "x")
@@ -334,6 +342,9 @@ def test_sandboxed_script_cannot_even_open_a_pty(notes, home):
     ("python3 -m togi --json run -", True), ("python3 -m togi --text --json run -", True),
     ("/Users/x/bin/togi run -", True), ("togi run script.py", True), ("/Users/x/bin/togi --json run -", True),
     ("/opt/homebrew/bin/python3.12 /Users/x/.local/bin/togi --json run -", True),
+    ("/usr/bin/python3 -I /Users/x/togi/src/togi/_launch.py run -", True),       # r4: how the launcher starts the host
+    ("/usr/bin/python3 -I /Users/x/togi/src/togi/_launch.py --json run x.py --timeout 5", True),
+    ("/usr/bin/python3 -I /Users/x/togi/src/togi/_launch.py approve ap_1", False),
     ("python3 -m togi approve ap_1", False), ("togi notes add --text run", False), ("vim togi run.txt", False),
     ("python3 -m pytest tests/test_run.py", False), ("/bin/zsh -c togi approve", False),
 ])
@@ -427,12 +438,11 @@ def test_host_environment_is_an_allowlist():
                "AWS_ACCESS_KEY_ID": "a", "BUNDLE_TOKEN": "b", "SSH_AUTH_SOCK": "/sock", "HTTPS_PROXY": "http://p"}
     env, oob = runmode.host_environment(environ, [])
     assert set(env) == {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TOGI_HOME", "TOGI_AGENT",
-                        "TOGI_APPROVAL_TTL", "PYTHONPATH"}
-    assert env["PYTHONPATH"] == str(paths.src_dir()) and oob == {}                 # not the caller's PYTHONPATH
+                        "TOGI_APPROVAL_TTL"} and oob == {}                         # no PYTHON* at all: the host runs python -I
     env, oob = runmode.host_environment(environ, ["BUNDLE_TOKEN", "HTTPS_PROXY", "NOT_SET_ANYWHERE"])
     assert "BUNDLE_TOKEN" not in env and oob == {"BUNDLE_TOKEN": "b", "HTTPS_PROXY": "http://p"}   # handed over, not left
-    env, _ = runmode.host_environment(environ, ["PYTHONPATH"])
-    assert env["PYTHONPATH"] == os.pathsep.join([str(paths.src_dir()), "/p"])
+    env, oob = runmode.host_environment(environ, ["PYTHONPATH"])       # even a manifest cannot carry PYTHONPATH in
+    assert not [k for k in env if k.startswith("PYTHON")] and not [k for k in oob if k.startswith("PYTHON")]
 
 
 def test_reexec_leaves_in_process_callers_alone(home):
@@ -582,6 +592,7 @@ def test_the_sandbox_probe_is_not_vacuous_an_unsandboxed_child_reads_all_of_it(n
                     reason="sandbox-exec is macOS only")
 def test_a_script_cannot_import_the_engine_and_move_money_without_approval(notes, home):
     """The Crowd refuter's finding: `togi run -` importing the engine and calling it directly."""
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     script = f"""
         import importlib.util, sys
         for name in ("notes",):
@@ -684,6 +695,7 @@ print(p.returncode, "needs_approval" in p.stdout)
 
 def test_nested_togi_call_from_a_script_stays_in_the_hosts_home(notes, home, tmp_path):
     """Item 10: the refuter's nested.py. Without TOGI_HOME the nested call fell back to the user's real ~/.togi."""
+    lock_bundle("notes")     # the money path needs a verified lock (notes has locked tiers)
     fake_home = tmp_path / "realhome"
     (fake_home / ".togi").mkdir(parents=True)
     shutil.copy(home / "bundles.toml", fake_home / ".togi" / "bundles.toml")        # the user's REAL registry

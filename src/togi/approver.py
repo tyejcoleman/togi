@@ -200,6 +200,9 @@ def ensure_key(repair: bool = False) -> bytes:
         except OSError:
             pass
         raise
+    from . import spent
+
+    spent.retire_for_new_key()   # grants signed with a lost key are dead; so is a spent record only that key could verify
     return key
 
 

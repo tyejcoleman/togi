@@ -14,6 +14,7 @@ human `apply` refuse while the override is set (approvals.require_default_scope)
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from .errors import TogiError
@@ -130,5 +131,20 @@ def bench_dir(bundle: str) -> Path:
 
 
 def src_dir() -> Path:
-    """Directory that contains the `togi` package (put on PYTHONPATH for child processes)."""
+    """Directory that contains the `togi` package."""
     return Path(__file__).resolve().parent.parent
+
+
+def launcher_path() -> Path:
+    """The standalone launcher script (`_launch.py`): the one way Togi starts itself."""
+    return Path(__file__).resolve().parent / "_launch.py"
+
+
+def isolated_argv(args: list[str] | tuple[str, ...] = ()) -> list[str]:
+    """argv that starts Togi in an ISOLATED interpreter: `python -I _launch.py ARGS`.
+
+    `-I` means no current directory and no script directory on `sys.path` and every PYTHON* variable ignored, so
+    nothing planted in the directory a person happens to be standing in (a `hmac.py`, a `json.py`) and nothing in
+    `PYTHONPATH` can run inside Togi. The launcher puts Togi's own `src` on `sys.path` explicitly. Every place Togi
+    starts itself (the `togi` launcher, the `togi run` host re-exec, the stone's `togi` shim and MCP server) uses this."""
+    return [sys.executable, "-I", str(launcher_path()), *args]

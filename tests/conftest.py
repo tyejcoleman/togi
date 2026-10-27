@@ -50,11 +50,12 @@ REAL_PW_DIR = _real_pw_dir()          # captured at import, before any test patc
 
 
 def approver_files(root: Path) -> dict:
-    """Every approver-related file directly inside `root` (approver, approver.key, approver.state, temp files)."""
+    """Every approver-related file directly inside `root` (approver, approver.key, approver.state, the spent-approval
+    record, temp files)."""
     out = {}
     try:
         for f in root.iterdir():
-            if "approver" in f.name:
+            if "approver" in f.name or f.name.startswith("spent"):     # spent.jsonl / spent.head live beside the key
                 st = f.stat()
                 out[f.name] = (st.st_size, st.st_mtime_ns, st.st_ino)
     except FileNotFoundError:
@@ -78,8 +79,9 @@ def clean_env(home: Path, **extra) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith("TOGI_")}
     env["TOGI_HOME"] = str(home)
     env["TOGI_APPROVER_HOME"] = str(throwaway_approver_home(home))
-    env["PYTHONPATH"] = str(SRC)
+    env["PYTHONPATH"] = str(SRC)          # inert for togi itself (it runs `python -I`); some tests start other interpreters
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["NOTES_TEST_MODE"] = "1"          # the notes example's own test mode (its tip_send refuses test-scope approvals outside it)
     env.update({k: v for k, v in extra.items() if v is not None})
     return env
 
@@ -88,21 +90,26 @@ def clean_env(home: Path, **extra) -> dict:
 # FIXED approver location (no TOGI_APPROVER_HOME) without ever touching the real one.
 PW_SHIM = """
 import pwd, sys
-_fake, _real = sys.argv[1], pwd.getpwuid
+_fake, _src, _real = sys.argv[1], sys.argv[2], pwd.getpwuid
 def _getpwuid(uid):
     r = _real(uid)
     return pwd.struct_passwd((r.pw_name, r.pw_passwd, r.pw_uid, r.pw_gid, r.pw_gecos, _fake, r.pw_shell))
 pwd.getpwuid = _getpwuid
-sys.argv = ["togi"] + sys.argv[2:]
+sys.argv = ["togi"] + sys.argv[3:]
+sys.path.insert(0, _src)
 from togi.cli import main
 sys.exit(main())
 """
 
 
 def togi_argv(argv, fake_pw_dir: Path | None = None) -> list[str]:
+    """How a test starts togi: the launcher's own isolated form (`python -I _launch.py`, paths.isolated_argv), or, with
+    a faked password database, `python -I -c SHIM` (isolated too: the human gates refuse any other kind)."""
+    from togi import paths
+
     if fake_pw_dir is None:
-        return [sys.executable, "-m", "togi", *argv]
-    return [sys.executable, "-c", PW_SHIM, str(fake_pw_dir), *argv]
+        return paths.isolated_argv(argv)
+    return [sys.executable, "-I", "-c", PW_SHIM, str(fake_pw_dir), str(SRC), *argv]
 
 
 @pytest.fixture(autouse=True)
@@ -139,6 +146,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("TOGI_HOME", str(h))
     monkeypatch.setenv("TOGI_APPROVER_HOME", str(throwaway_approver_home(h)))
     monkeypatch.setenv("TOGI_SESSION", "test-session")
+    monkeypatch.setenv("NOTES_TEST_MODE", "1")      # see clean_env
     monkeypatch.chdir(tmp_path)
     from togi import approver
 
@@ -220,7 +228,7 @@ def _resolve_scope(argv, scope: str, fake_pw: Path | None, drop_env: tuple) -> t
 
 def run_togi(home: Path, *argv, input: str | None = None, env_extra: dict | None = None, timeout: int = 60,
              cwd: Path | None = None, drop_env: tuple = (), fake_pw: Path | None = None, scope: str = "auto"):
-    """Run `python3 -m togi` as a subprocess with piped stdio (what an agent's shell looks like). `fake_pw` makes
+    """Run togi (isolated, as the launcher starts it) as a subprocess with piped stdio (what an agent's shell looks like). `fake_pw` makes
     the account home a temp dir (see PW_SHIM); `drop_env` removes variables, e.g. ("TOGI_APPROVER_HOME",); `scope`
     chooses the approver (see the note at the top: "auto" = default scope for lock/revert/apply)."""
     fake_pw, drop_env = _resolve_scope(argv, scope, fake_pw, drop_env)
@@ -232,12 +240,15 @@ def run_togi(home: Path, *argv, input: str | None = None, env_extra: dict | None
 
 
 def run_in_pty(home: Path, argv, typed=None, env_extra: dict | None = None, timeout: int = 60,
-               drop_env: tuple = (), fake_pw: Path | None = None, scope: str = "auto") -> tuple[int, str]:
+               drop_env: tuple = (), fake_pw: Path | None = None, scope: str = "auto",
+               cwd: Path | None = None, cmd: list[str] | None = None) -> tuple[int, str]:
     """Run togi on a real pseudo-terminal that is the child's CONTROLLING terminal (so /dev/tty works): what a
     person at a terminal looks like. `typed` is answered in order, one line per prompt: each item is either a
     string (typed once the child has printed something new and gone quiet) or (expect, string) (typed once
     `expect` has appeared in the output). `scope`: see the note at the top ("auto" = the default-scope approver for
-    lock/revert/apply, a test-scope one for the rest). Returns (exit code, everything the terminal showed)."""
+    lock/revert/apply, a test-scope one for the rest). `cwd` is the directory the child starts in; `cmd` replaces the
+    command line (default: togi started the way the launcher starts it). Returns (exit code, everything the terminal
+    showed)."""
     fake_pw, drop_env = _resolve_scope(argv, scope, fake_pw, drop_env)
     env = clean_env(home, **(env_extra or {}))
     for k in drop_env:
@@ -245,8 +256,10 @@ def run_in_pty(home: Path, argv, typed=None, env_extra: dict | None = None, time
     pid, fd = pty.fork()
     if pid == 0:  # child: pty.fork made the slave our stdio and controlling terminal
         try:
-            cmd = togi_argv(argv, fake_pw)
-            os.execve(cmd[0], cmd, env)
+            if cwd is not None:
+                os.chdir(cwd)
+            argv_ = cmd if cmd is not None else togi_argv(argv, fake_pw)    # `cmd`: any launcher, e.g. bin/togi itself
+            os.execve(argv_[0], argv_, env)
         finally:
             os._exit(127)
     out = b""

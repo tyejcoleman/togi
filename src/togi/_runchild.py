@@ -15,6 +15,14 @@ import traceback
 import types
 
 
+MAX_MESSAGE = 1000   # an error message the child reports to the host; the host caps it again
+
+
+def cut(text, limit=MAX_MESSAGE):
+    s = text if isinstance(text, str) else str(text)
+    return s if len(s) <= limit else s[:limit] + f"...[+{len(s) - limit} chars]"
+
+
 def main():
     errors_path, fd, script_path, names_json = sys.argv[1:5]
     spec = importlib.util.spec_from_file_location("togi", errors_path)
@@ -123,17 +131,17 @@ def main():
         raise
     except togi.TogiError as e:
         rpc_fatal = {"op": "fatal", "kind": "needs_approval" if isinstance(e, togi.NeedsApproval) else "togi_error",
-                     "code": e.code, "message": e.message, "next": e.next, "status": e.status,
-                     "approval": getattr(e, "approval", None)}
+                     "code": cut(e.code, 80), "message": cut(e.message), "next": cut(e.next) if e.next else None,
+                     "status": e.status, "approval": getattr(e, "approval", None)}
         wf.write(json.dumps(rpc_fatal) + "\n")
         wf.flush()
         sys.exit(3 if e.status == "needs_approval" else (2 if e.status == "refused" else 1))
     except BaseException as e:  # script bug: show the traceback without togi's own frames
         frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename != __file__]
-        sys.stderr.write("Traceback (most recent call last):\n" + "".join(traceback.format_list(frames))
-                         + "".join(traceback.format_exception_only(type(e), e)))
+        sys.stderr.write(cut("Traceback (most recent call last):\n" + "".join(traceback.format_list(frames))
+                             + "".join(traceback.format_exception_only(type(e), e)), 8000) + "\n")
         wf.write(json.dumps({"op": "fatal", "kind": "exception", "code": "script_error",
-                             "message": f"{type(e).__name__}: {e}"}) + "\n")
+                             "message": cut(f"{type(e).__name__}: {e}")}) + "\n")
         wf.flush()
         sys.exit(1)
 

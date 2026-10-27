@@ -20,6 +20,7 @@ refused (`test_scope_refused`), and a recorded evaluation approval only counts i
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import secrets
 import shutil
@@ -37,9 +38,13 @@ from .journal import now_ts
 from .manifest import APPLY_DRIVERS, MIN_APPLY_RUNS, TIER_ORDER, Manifest, load_manifest, walk_files
 from .pathnorm import escape_text, fold
 
-# Files that can carry code. A polish proposal may not touch any; a reshape proposal's may only be evaluated after
-# a person approved the evaluation. (Content that starts with a shebang counts too: a script needs no extension.)
-CODE_EXTENSIONS = (".py", ".pyc", ".so", ".sh", ".js", ".ts")
+# A polish proposal is evaluated AUTOMATICALLY, so it may only touch plain text. The rule is an ALLOWLIST, not a list of
+# bad extensions: anything not in it counts as code for this purpose (an unknown or missing extension, `.cfg`, `.ini`,
+# `.html`, `.pth`, a `Makefile`...). `.toml` is text except the two files that configure a build or Togi itself. Content
+# that starts with a shebang is code whatever its name. A reshape proposal's code is only evaluated after a person
+# approved the evaluation.
+TEXT_EXTENSIONS = (".md", ".txt", ".toml", ".json", ".yaml", ".yml")
+NOT_TEXT_NAMES = ("pyproject.toml", "togi.toml")
 MAX_REVIEW_DIFF_LINES = 1000   # a person approves what they were shown: a diff too long to show is not approvable here
 MIN_RUNS = MIN_APPLY_RUNS
 NOISE_PCT = 15.0  # median turns / tokens / cost must improve by at least this much ...
@@ -98,6 +103,49 @@ def list_proposals() -> list[dict]:
 
 def diff_sha(diff: str) -> str:
     return hashlib.sha256(diff.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------- the evaluation cache is signed
+#
+# `proposals/<id>/evaluation.json` holds the stone's before/after comparison that `decide` reads. Whoever can write
+# $TOGI_HOME could put a flattering comparison there and have a polish proposal auto-apply on it, so the cache is
+# MAC'd with the audit key (the one that signs the audit log) and an unsigned, edited or foreign one is ignored: the
+# stone simply runs again. The MAC covers the proposal id and everything in the record.
+
+EVAL_DOMAIN = "togi-eval-v1\n"
+
+
+def _eval_blob(pid: str, ev: dict) -> bytes:
+    body = {"proposal": pid, "evaluation": {k: v for k, v in ev.items() if k != "mac"}}
+    return (EVAL_DOMAIN + json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                                     default=str)).encode("ascii")
+
+
+def sign_evaluation(pid: str, ev: dict) -> str:
+    return hmac.new(audit.ensure_key(), _eval_blob(pid, ev), hashlib.sha256).hexdigest()
+
+
+def evaluation_signed(pid: str, ev: object) -> bool:
+    """True only for a cache record signed with THIS machine's audit key for THIS proposal. Never raises."""
+    if not isinstance(ev, dict) or not isinstance(ev.get("mac"), str):
+        return False
+    try:
+        key = audit.load_key()
+    except TogiError:
+        return False
+    if key is None:
+        return False
+    return hmac.compare_digest(ev["mac"], hmac.new(key, _eval_blob(pid, ev), hashlib.sha256).hexdigest())
+
+
+def read_evaluation(pid: str) -> dict | None:
+    """The cached evaluation of a proposal if it is present AND signed; None otherwise (re-run the stone)."""
+    cache = proposal_dir(pid) / "evaluation.json"
+    try:
+        ev = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return ev if evaluation_signed(pid, ev) else None
 
 
 # --------------------------------------------------------------------------- classification
@@ -160,8 +208,8 @@ def classify_diff(diff: str, man: Manifest) -> Classified:
     return Classified(patches, tiers, top, violation)
 
 
-CODE_IN_POLISH_TEXT = ("a polish proposal may not touch files that can carry code (.py, .pyc, .so, .sh, .js, .ts, or "
-                       "anything starting with #!)")
+CODE_IN_POLISH_TEXT = ("a polish proposal may only touch plain-text files (.md, .txt, .toml other than pyproject.toml / "
+                       "togi.toml, .json, .yaml, .yml); anything else counts as code, as does a file starting with #!")
 
 VIOLATION_TEXT = {
     "locked_file": "the diff touches a locked file",
@@ -366,11 +414,15 @@ def write_verified(repo: Path, man: Manifest, changes: dict[str, str]) -> dict |
 
 
 def is_code_path(rel: str) -> bool:
-    return fold(rel).endswith(CODE_EXTENSIONS)
+    """True unless `rel` is a plain-text type on the allowlist (TEXT_EXTENSIONS, minus pyproject.toml / togi.toml)."""
+    f = fold(rel)
+    base = f.rsplit("/", 1)[-1]
+    return not f.endswith(TEXT_EXTENSIONS) or base in NOT_TEXT_NAMES
 
 
 def code_bearing_files(plan: dict[str, str]) -> list[str]:
-    """Touched files that can carry code: by extension, or because the new content starts with a shebang."""
+    """Touched files that can carry code: any that is not an allowlisted text type, or whose new content starts with
+    a shebang."""
     return sorted(rel for rel, text in plan.items() if is_code_path(rel) or text.startswith("#!"))
 
 
@@ -475,17 +527,13 @@ def apply_proposal(pid: str, *, runs: int | None = None, driver: str | None = No
     if meta.get("diff_sha256") and meta["diff_sha256"] != sha:
         return _reject(meta, man, cl, sha, "diff_modified", "the proposal's diff changed after hone stored it",
                        dry_run=dry_run)
-    chain = audit.verify(repo, bundle)
-    if not chain["ok"]:
-        p0 = chain["problems"][0]
-        raise TogiError("audit_chain_broken", f"the audit log is broken at seq {p0['seq']}: {p0['problem']}",
-                        next=f"togi log {bundle} --verify")
+    audit.require_trusted_chain(repo, bundle)   # intact AND authenticated by this machine's key (L1)
     lock = audit.verify_locked(repo, man)
     if not lock["locked_file_present"]:
         raise TogiError("not_locked", "this bundle has no .togi/locked.sha256, so locked files cannot be enforced",
                         next=f"togi lock {bundle}")
     if not lock["ok"]:
-        bad = (lock["changed"] + lock["missing"] + lock["unlisted"])[:5]
+        bad = audit.lock_problems(lock)[:5] or [lock.get("problem", "the lock is not anchored")]
         return _reject(meta, man, cl, sha, "locked_hash_mismatch",
                        "locked files differ from .togi/locked.sha256: " + ", ".join(bad), dry_run=dry_run,
                        raise_instead=True, next=f"review the change, then: togi lock {bundle}")
@@ -521,13 +569,9 @@ def apply_proposal(pid: str, *, runs: int | None = None, driver: str | None = No
     key = _eval_key(repo, sha, driver, model, runs, surface)
     cache = proposal_dir(pid) / "evaluation.json"
     ev = None
-    if cache.is_file():
-        try:
-            cached = json.loads(cache.read_text(encoding="utf-8"))
-            if cached.get("key") == key:
-                ev = cached
-        except (OSError, ValueError):
-            pass
+    cached = read_evaluation(pid)      # only a record signed by this machine's key; anything else is ignored
+    if cached is not None and cached.get("key") == key:
+        ev = cached
     if ev is None:
         before_res = stone.run_stone(repo, driver=driver, model=model, runs=runs, surface=surface,
                                      task_timeout=task_timeout, label=f"{pid}-before")
@@ -545,6 +589,7 @@ def apply_proposal(pid: str, *, runs: int | None = None, driver: str | None = No
         ev = {"key": key, "before": compact(before_res["summary"], before_res["id"]),
               "after": compact(after_res["summary"], after_res["id"]),
               "driver": driver, "model": model, "runs": runs, "surface": surface, "at": now_ts()}
+        ev["mac"] = sign_evaluation(pid, ev)
         cache.write_text(json.dumps(ev, indent=1), encoding="utf-8")
     dec = decide(cl.tier, man.auto_polish, ev["before"], ev["after"], touches_skill=touches_skill, driver=driver)
     result: dict[str, Any] = {"proposal": pid, "bundle": bundle, "tier": cl.tier, "files": files,
@@ -583,7 +628,7 @@ def apply_proposal(pid: str, *, runs: int | None = None, driver: str | None = No
                         next=f"togi lock {bundle}")
     moved = write_verified(repo, man, plan)
     if moved is not None:
-        bad = (moved["changed"] + moved["missing"] + moved["unlisted"])[:5]
+        bad = audit.lock_problems(moved)[:5]
         return _reject(meta, man, cl, sha, "locked_files_changed_by_write",
                        "the write changed locked files and was rolled back: " + ", ".join(bad), dry_run=False,
                        raise_instead=True, next="review the proposal's paths; the classifier and the filesystem "
@@ -680,11 +725,7 @@ def revert_proposal(pid: str) -> dict:
     repo = Path(meta["repo"])
     man = load_manifest(repo)
     sha = diff_sha(diff)
-    chain = audit.verify(repo, man.name)
-    if not chain["ok"]:
-        p0 = chain["problems"][0]
-        raise TogiError("audit_chain_broken", f"the audit log is broken at seq {p0['seq']}: {p0['problem']}",
-                        next=f"togi log {man.name} --verify", status="refused")
+    audit.require_trusted_chain(repo, man.name, status="refused")
     applied = [e for e in audit.read(repo) if e.get("action") == "apply" and e.get("proposal") == pid]
     if not applied or applied[-1].get("diff_sha256") != sha:
         raise TogiError("proposal_modified", f"the diff stored for {pid} is not the one the audit log says was "
@@ -705,7 +746,7 @@ def revert_proposal(pid: str) -> dict:
         raise TogiError("not_locked", "this bundle has no .togi/locked.sha256, so locked files cannot be enforced",
                         next=f"togi lock {man.name}", status="refused")
     if not lock["ok"]:
-        bad = (lock["changed"] + lock["missing"] + lock["unlisted"])[:5]
+        bad = audit.lock_problems(lock)[:5] or [lock.get("problem", "the lock is not anchored")]
         return _reject(meta, man, cl, sha, "locked_hash_mismatch",
                        "locked files differ from .togi/locked.sha256: " + ", ".join(bad), dry_run=False,
                        raise_instead=True, close_proposal=False,
@@ -740,7 +781,7 @@ def revert_proposal(pid: str) -> dict:
     after = audit.verify_locked(repo, man)
     if not after["ok"]:
         restore(repo, snap)
-        bad = (after["changed"] + after["missing"] + after["unlisted"])[:5]
+        bad = audit.lock_problems(after)[:5]
         return _reject(meta, man, cl, sha, "locked_files_changed_by_write",
                        "the revert changed locked files and was rolled back: " + ", ".join(bad), dry_run=False,
                        raise_instead=True, close_proposal=False,
@@ -764,13 +805,9 @@ def h_review(argv: list[str]) -> Reply:
         return Reply(env=output.ok_envelope(list_proposals()), mode=_mode(f))
     meta, diff, rationale = load_proposal(pos[0])
     ev = None
-    ep = proposal_dir(pos[0]) / "evaluation.json"
-    if ep.is_file():
-        try:
-            e = json.loads(ep.read_text(encoding="utf-8"))
-            ev = {"before": e["before"], "after": e["after"], "driver": e.get("driver"), "runs": e.get("runs")}
-        except (OSError, ValueError, KeyError):
-            pass
+    e = read_evaluation(pos[0])        # a cache that is not signed by this machine's key is not shown as a result
+    if e is not None:
+        ev = {"before": e.get("before"), "after": e.get("after"), "driver": e.get("driver"), "runs": e.get("runs")}
     data = {"id": meta["id"], "bundle": meta["bundle"], "status": meta.get("status"), "tier": meta.get("tier"),
             "files": meta.get("files"), "rationale": rationale.strip(), "diff": diff, "stone": ev,
             "next": f"togi apply {meta['id']}" if meta.get("status") in ("proposed", "needs_human") else None}

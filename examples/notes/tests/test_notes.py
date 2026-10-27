@@ -10,7 +10,8 @@ from notes.togi_bundle import add, delete, find, list_notes, show, tip_send, tip
 
 
 @pytest.fixture
-def ctx(tmp_path):
+def ctx(tmp_path, monkeypatch):
+    monkeypatch.setenv("NOTES_TEST_MODE", "1")   # the bundle's own test mode (the stone sets it from [stone].env)
     return Context(bundle="notes", state_dir=tmp_path)
 
 
@@ -68,3 +69,17 @@ def test_summary_shape_and_snippet():
     s = summarize(long)
     assert set(s) == {"id", "text", "tags"} and len(s["text"]) == SNIPPET and s["text"].endswith("…")
     assert summarize({"id": "n_2", "text": "short"})["text"] == "short"
+
+
+def test_tip_refuses_a_test_scope_approval_outside_test_mode(ctx, monkeypatch):
+    """SPEC section 2: a bundle that moves value refuses an approval from a throwaway approver outside its test mode."""
+    add(text="x", ctx=ctx)
+    monkeypatch.delenv("NOTES_TEST_MODE")
+    for scope in ("test", None):
+        ctx.approval_scope = scope
+        with pytest.raises(TogiError) as e:
+            tip_send(id="n_1", amount=Decimal("1.00"), ctx=ctx)
+        assert e.value.code == "test_scope_refused" and e.value.status == "refused"
+    assert tip_total(ctx=ctx)["count"] == 0
+    ctx.approval_scope = "default"                       # the real approver's grant is fine
+    assert tip_send(id="n_1", amount=Decimal("1.00"), ctx=ctx)["amount"] == "1.00"

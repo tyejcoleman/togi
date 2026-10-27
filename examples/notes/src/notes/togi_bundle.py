@@ -1,6 +1,7 @@
 """The notes bundle: the smallest useful example of the Togi contract."""
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 from typing import Literal, Optional
 
@@ -66,6 +67,14 @@ def delete(id: str, ctx: Context = None) -> dict:
 @bundle.command("tip send", effect="money", confirm="id", examples=["togi notes tip send --id n_1 --amount 5.00"])
 def tip_send(id: str, amount: Decimal, ctx: Context = None) -> dict:
     """Send a tip to a note's author. Moves money: needs a person's approval."""
+    # The rule every bundle that moves value must follow (SPEC section 2): an approval signed by a throwaway
+    # (test-scope) approver proves only that someone typed a passphrase of their own, so it is refused outside this
+    # bundle's own test mode. (The manifest says `test_approvals = true` precisely because this check is here.)
+    if ctx.approval_scope != "default" and not os.environ.get("NOTES_TEST_MODE"):
+        raise TogiError("test_scope_refused", "this tip was approved by a throwaway (test-scope) approver; tips are "
+                        "only sent on an approval from the real approver", status="refused",
+                        next="ask the person to approve it in their own terminal with the real approver "
+                             "(TOGI_APPROVER_HOME unset)")
     store = Store(ctx.state_dir)
     if not store.get(id):
         raise _err("note_not_found", id=id)

@@ -13,9 +13,14 @@ locked  = ["togi.toml", "stone/**", "tests/**", "src/notes/store.py", "src/notes
 [stone]
 tests = "tests"
 tasks = "stone/tasks"
+env = {NOTES_TEST_MODE = "1"}   # tests and agent tasks run in the bundle's own test mode (the fake-mode of a real bundle)
 
 [policy]
 approve_effects = ["money"]
 auto_polish = true
+test_approvals = true     # tip_send checks ctx.approval_scope itself (see togi_bundle.py), so it accepts test-scope grants
+                          # in test mode. A bundle that does not check must leave this out: Togi then refuses test grants.
+run_env = ["NOTES_TEST_MODE"]   # `togi run` scrubs its host's environment; the bundle's test-mode switch has to be allowed through
+# require_lock is not set: this bundle has locked tiers, so its money commands need a verified `togi lock` (the default)
 apply_driver = "script"   # this offline example is judged by deterministic replays; real bundles default to "claude"
 apply_runs = 2            # minimum runs per task when `togi apply` evaluates a change (default 3)

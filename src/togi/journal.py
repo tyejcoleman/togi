@@ -51,20 +51,38 @@ def value_shape(v: str) -> str:
     return "<num>" if _NUM.match(v) else "<str>"
 
 
-def flag_shape(tok: str) -> str:
-    """`--amount=5.00` -> `--amount=<num>`; `--name` -> `--name`. A flag-looking token whose 'name' is not a
-    plausible flag name (a value in disguise) is recorded as `--<flag>`."""
+# Every flag the host itself understands, on any host command. A flag name is only recorded in the clear when it is one
+# of these or a flag of one of the bundle's commands: anything else is a name somebody made up, and a made-up name is
+# exactly where a value hides (`--sk-live-4f9a...`), so it is recorded as a hash.
+HOST_FLAGS = frozenset({
+    "json", "text", "full", "fields", "limit", "offset", "help", "dry-run", "approval",      # every command
+    "ttl", "all", "local", "verify", "chain-only", "topics", "friction", "since",            # approve, approvals, add, log, ...
+    "runs", "driver", "model", "surface", "surfaces", "tasks", "no-tests", "task-timeout",   # stone, apply, bench
+    "max-cost", "diff", "rationale", "timeout", "max-output"})                               # hone, run
+
+
+def flag_name_shape(name: str, known: Iterable[str] | None = None) -> str:
+    """The name of a flag as the journal records it: itself if it is a KNOWN flag, else `#` and 8 hex digits of its hash
+    (same name, same hash, so repeats still group in the friction summary, but the name itself is not stored)."""
+    norm = name.replace("_", "-").lower()
+    if _FLAG_NAME.match(name) and (norm in HOST_FLAGS or (known is not None and norm in known)):
+        return name
+    return "#" + hashlib.sha256(b"togi-flag\n" + norm.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def flag_shape(tok: str, known: Iterable[str] | None = None) -> str:
+    """`--amount=5.00` -> `--amount=<num>` (a known flag keeps its name); `--sk-live-1234` -> `--#a1b2c3d4` (an unknown
+    one is hashed)."""
     name, eq, val = tok[2:].partition("=")
-    base = "--" + (name if _FLAG_NAME.match(name) else "<flag>")
-    return base + (("=" + value_shape(val)) if eq else "")
+    return "--" + flag_name_shape(name, known) + (("=" + value_shape(val)) if eq else "")
 
 
-def argv_shape(tokens: list[str]) -> list[str]:
-    """argv with every value replaced by its type; flag names are kept."""
+def argv_shape(tokens: list[str], known: Iterable[str] | None = None) -> list[str]:
+    """argv with every value replaced by its type; known flag names are kept, unknown ones hashed."""
     out = []
     for t in tokens:
         if t.startswith("--") and len(t) > 2:
-            out.append(flag_shape(t))
+            out.append(flag_shape(t, known))
         elif t.startswith("-") and len(t) > 1 and not _NUM.match(t):
             out.append("-<short>")
         else:
@@ -72,18 +90,33 @@ def argv_shape(tokens: list[str]) -> list[str]:
     return out
 
 
-def sanitize_attempt(attempted: str | None, vocab: set[str] | frozenset[str] = frozenset()) -> str | None:
-    """What may be written about an unknown command/flag: a flag keeps its name, a word is kept only if it is
-    (or is a near-miss of) a real command word of the bundle -- that typo is exactly the friction signal hone
-    needs and cannot be a value -- and every other token becomes `<num>` / `<str>`."""
+def nearest_flag(attempted: str | None, known: Iterable[str] | None) -> str | None:
+    """For an unknown flag that was hashed: the KNOWN flag it most resembles (`--tgs` -> `--tag`), if any is close. The
+    hint is one of the bundle's own flag names, never the attempted text, so hone still sees the typo without the journal
+    storing what was typed."""
+    if not attempted or not attempted.startswith("--") or not known:
+        return None
+    name = attempted[2:].partition("=")[0].replace("_", "-").lower()
+    if not _FLAG_NAME.match(name):
+        return None
+    close = difflib.get_close_matches(name, sorted(set(known) | HOST_FLAGS), n=1, cutoff=0.6)
+    return "--" + close[0] if close else None
+
+
+def sanitize_attempt(attempted: str | None, vocab: set[str] | frozenset[str] = frozenset(),
+                     known_flags: Iterable[str] | None = None) -> str | None:
+    """What may be written about an unknown command/flag: a flag keeps its name only if it is a known flag (of the host
+    or of any command of the bundle: `known_flags`), otherwise it is hashed; a word is kept only if it is (or is a
+    near-miss of) a real command word of the bundle -- that typo is exactly the friction signal hone needs and cannot
+    be a value -- and every other token becomes `<num>` / `<str>`."""
     if attempted is None:
         return None
     if attempted.startswith("--"):
-        return flag_shape(attempted).split("=", 1)[0]
+        return flag_shape(attempted, known_flags).split("=", 1)[0]
     words = []
     for w in attempted.split():
         if w.startswith("-"):
-            words.append(flag_shape(w) if w.startswith("--") else "-<short>")
+            words.append(flag_shape(w, known_flags) if w.startswith("--") else "-<short>")
         elif _WORD.match(w) and (w in vocab or difflib.get_close_matches(w, list(vocab), n=1, cutoff=0.75)):
             words.append(w)
         else:
@@ -228,6 +261,7 @@ def friction(entries: Iterable[dict], top: int = 5) -> dict:
     codes = Counter()
     unknown_cmds = Counter()
     unknown_flags: dict[tuple, int] = defaultdict(int)
+    near: dict[tuple, str] = {}
     total = 0
     for e in entries:
         ev = e.get("event", "call")
@@ -240,6 +274,8 @@ def friction(entries: Iterable[dict], top: int = 5) -> dict:
             continue
         if ev == "unknown_flag":
             unknown_flags[(cmd or "?", e.get("attempted") or "?")] += 1
+            if e.get("near"):
+                near[(cmd or "?", e.get("attempted") or "?")] = e["near"]
             continue
         if ev != "call":
             continue
@@ -265,7 +301,7 @@ def friction(entries: Iterable[dict], top: int = 5) -> dict:
         "top_error_codes": [{"code": c, "count": n} for c, n in codes.most_common(top)],
         "repeated_retries": [{"command": c, "count": n} for c, n in retries.most_common(top)],
         "unknown_commands": [{"attempted": a, "count": n} for a, n in unknown_cmds.most_common(top)],
-        "unknown_flags": [{"command": c, "flag": f, "count": n}
+        "unknown_flags": [{"command": c, "flag": f, "count": n, **({"near": near[(c, f)]} if near.get((c, f)) else {})}
                           for (c, f), n in sorted(unknown_flags.items(), key=lambda kv: -kv[1])[:top]],
         "truncated_outputs": [{"command": c, "count": n} for c, n in truncated.most_common(top)],
         "help_lookups": [{"command": c, "count": n} for c, n in helps.most_common(top)],

@@ -10,7 +10,7 @@ import pytest
 
 from togi import stone
 
-from conftest import togi, togi_code
+from conftest import lock_bundle, togi, togi_code
 
 
 def write_task(repo: Path, name: str, body: str):
@@ -22,7 +22,7 @@ def test_script_driver_runs_example_stone(notes, home):
     d = out["data"]
     s = d["summary"]
     assert out["ok"] is True and d["failed_tasks"] == []
-    assert s["tests"] == {"passed": 8, "failed": 0, "errors": 0, "total": 8, "ok": True}
+    assert s["tests"] == {"passed": 9, "failed": 0, "errors": 0, "total": 9, "ok": True}
     assert s["nonholdout"]["successes"] == 2 and s["holdout"]["successes"] == 1
     assert s["forbidden"] == 0 and s["median_turns"] == 2
     saved = Path(d["path"])
@@ -30,7 +30,7 @@ def test_script_driver_runs_example_stone(notes, home):
     full = json.loads(saved.read_text())
     assert full["driver"] == "script" and {t["task"] for t in full["tasks"]} == {
         "add-and-find", "missing-note", "tip-needs-approval"}
-    assert "tests: 8 passed" in d["text"]
+    assert "tests: 9 passed" in d["text"]
 
 
 def test_stone_is_hermetic_and_never_touches_real_journal_or_state(notes, home):
@@ -116,7 +116,7 @@ def test_deterministic_test_failures_are_counted(notes, home):
     t = notes / "tests" / "test_notes.py"
     t.write_text(t.read_text() + "\n\ndef test_broken():\n    assert False\n")
     r = stone.run_stone(notes, task_ids=["missing-note"], save=False)
-    assert r["tests"]["failed"] == 1 and r["tests"]["ok"] is False and r["tests"]["passed"] == 8
+    assert r["tests"]["failed"] == 1 and r["tests"]["ok"] is False and r["tests"]["passed"] == 9
     code, out = togi_code("stone", "notes", "--tasks", "missing-note")
     assert code == 1 and "deterministic test" in out["error"]["message"]
 
@@ -168,15 +168,17 @@ def test_claude_command_shape_and_env_scrub(notes, home, monkeypatch):
         mcp_cmd = stone.claude_command("haiku", "mcp", sb, None)
         cfg = json.loads(mcp_cmd[mcp_cmd.index("--mcp-config") + 1])
         srv = cfg["mcpServers"]["togi"]
-        assert srv["command"] == sys.executable and srv["args"] == ["-m", "togi", "mcp", "serve", "notes"]
+        assert srv["command"] == sys.executable
+        assert srv["args"] == ["-I", str(stone.paths.launcher_path()), "mcp", "serve", "notes"]   # isolated: python -I
         assert srv["env"]["TOGI_HOME"] == str(sb.home) and srv["env"]["TOGI_AGENT"] == "stone"
-        assert srv["env"]["PYTHONPATH"] == str(stone.paths.src_dir())
+        assert "PYTHONPATH" not in srv["env"]                      # the launcher adds Togi's src itself
         assert "--strict-mcp-config" in mcp_cmd and "--tools=" in mcp_cmd
         assert "--allowedTools=mcp__togi,mcp__togi__*" in mcp_cmd
         env = sb.env(agent=True)
         assert "ANTHROPIC_API_KEY" not in env and env["TOGI_AGENT"] == "stone" and env["TOGI_HOME"] == str(sb.home)
         assert env["PATH"].startswith(str(sb.bin))
-        assert (sb.bin / "togi").read_text().startswith("#!/bin/sh")
+        shim = (sb.bin / "togi").read_text()
+        assert shim.startswith("#!/bin/sh") and " -I " in shim and "PYTHONPATH" not in shim   # the same isolated launch
         assert sb.sh("togi version").stdout.startswith('{"ok":true')  # the shim works
         assert "TOGI_AGENT" not in sb.env(agent=False)  # harness commands are not the agent
     finally:

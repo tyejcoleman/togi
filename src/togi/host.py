@@ -6,8 +6,12 @@ Nothing else executes a bundle command, so a guard added here holds everywhere.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shlex
+import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -21,6 +25,7 @@ from .registry import Loaded
 
 
 MAX_HINT_CHARS = 300
+PRINT_CAP = 4096          # what a command may print to stdout while it runs; the rest is dropped
 
 
 @dataclass
@@ -89,20 +94,127 @@ def canonical_args(cmd: Command, full: dict[str, Any]) -> dict:
     return output.to_jsonable(full)
 
 
+class CappedStdout(io.TextIOBase):
+    """Stands in for `sys.stdout` while a bundle command runs: keeps the first `cap` characters and counts the rest. A
+    command that prints must not be able to flood (or corrupt) the result on stdout, which belongs to the envelope."""
+
+    def __init__(self, cap: int = PRINT_CAP):
+        self.cap, self.kept, self.total, self.parts = cap, 0, 0, []
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        n = len(text)
+        self.total += n
+        room = self.cap - self.kept
+        if room > 0:
+            self.parts.append(text[:room])
+            self.kept += min(n, room)
+        return n
+
+    def flush(self) -> None:
+        pass
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+class _StdoutRouter(io.TextIOBase):
+    """`sys.stdout` while any command runs: writes from a thread that is inside `capture_stdout` go to that thread's
+    sink, everything else (the host's own output, other threads) goes to the real stdout. Needed because the MCP bridge
+    runs tool calls on worker threads at the same time, and `contextlib.redirect_stdout` swaps one global."""
+
+    def __init__(self, saved):
+        self.saved = saved
+        self.local = threading.local()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        sink = getattr(self.local, "sink", None)
+        return sink.write(text) if sink is not None else self.saved.write(text)
+
+    def flush(self) -> None:
+        if getattr(self.local, "sink", None) is None:
+            self.saved.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self.saved, name)
+
+
+_ROUTE_LOCK = threading.Lock()
+_ROUTE: dict[str, Any] = {"depth": 0, "router": None, "saved": None}
+
+
+@contextlib.contextmanager
+def capture_stdout(sink):
+    """Send everything the current thread writes to `sys.stdout` into `sink` while the block runs."""
+    with _ROUTE_LOCK:
+        if _ROUTE["depth"] == 0:
+            _ROUTE["saved"] = sys.stdout
+            _ROUTE["router"] = _StdoutRouter(sys.stdout)
+            sys.stdout = _ROUTE["router"]
+        _ROUTE["depth"] += 1
+        router = _ROUTE["router"]
+    previous = getattr(router.local, "sink", None)
+    router.local.sink = sink
+    try:
+        yield
+    finally:
+        router.local.sink = previous
+        with _ROUTE_LOCK:
+            _ROUTE["depth"] -= 1
+            if _ROUTE["depth"] == 0:
+                if sys.stdout is router:
+                    sys.stdout = _ROUTE["saved"]
+                _ROUTE["router"] = _ROUTE["saved"] = None
+
+
+def note_shape(note: dict) -> dict:
+    """A journal note for a write/money/admin command: its keys and the TYPE of each value, never the value."""
+    def kind(v: Any) -> str:
+        for t, name in ((bool, "bool"), (int, "int"), (float, "float"), (str, "str"), (list, "list"), (tuple, "list"),
+                        (dict, "dict")):
+            if isinstance(v, t):
+                return name
+        return "null" if v is None else type(v).__name__
+
+    return {str(k): kind(v) for k, v in note.items()}
+
+
 def invoke(loaded: Loaded, cmd: Command, full: dict[str, Any], surface: str, session: str, agent: str | None,
-           approval_scope: str | None = None) -> Any:
+           approval_scope: str | None = None, extra: dict[str, Any] | None = None) -> Any:
     kwargs = dict(full)
     if cmd.ctx_param:
         def sink(note: dict) -> None:
+            # a note from a read command is stored as written; one from a write/money/admin command records keys and
+            # value types only (a note is the easiest place for a command to leak an amount or an id by accident)
+            shaped = output.to_jsonable(note) if cmd.effect == "read" else note_shape(note)
             journal.append(loaded.name, {"ts": journal.now_ts(), "session": session, "agent": agent,
                                          "surface": surface, "bundle": loaded.name, "command": cmd.name,
-                                         "event": "note", "note": output.to_jsonable(note)})
+                                         "event": "note", "note": shaped})
 
         state = paths.bundle_state(loaded.name) / "data"
         kwargs[cmd.ctx_param] = Context(bundle=loaded.name, surface=surface, agent=agent, state_dir=state,
                                         session=session, repo=loaded.repo, command=cmd.name, note_sink=sink,
                                         approval_scope=approval_scope)
-    return output.to_jsonable(cmd.func(**kwargs))
+    printed = CappedStdout()
+    try:
+        with capture_stdout(printed):
+            result = cmd.func(**kwargs)
+    finally:
+        if printed.total:   # stdout is the envelope's; what the command printed goes to stderr, capped
+            if extra is not None:
+                extra["printed_bytes"] = printed.total
+            cut = f" (first {printed.kept} shown)" if printed.total > printed.kept else ""
+            try:
+                sys.stderr.write(f"[togi: {loaded.name} {cmd.name} printed {printed.total} characters to stdout{cut}; "
+                                 f"stdout is reserved for the result]\n{printed.text()}\n")
+            except (OSError, ValueError):
+                pass
+    return output.to_jsonable(result)
 
 
 def dry_run_data(loaded: Loaded, cmd: Command, canon: dict, gated: bool) -> dict:
@@ -149,14 +261,18 @@ def call(loaded: Loaded, cmd: Command | None, args: dict[str, Any], opts: CallOp
         elif gated:
             env, approval_used = _gated(loaded, cmd, full, canon, opts, session, agent, extra)
         else:
-            env = output.ok_envelope(invoke(loaded, cmd, full, opts.surface, session, agent))
+            env = output.ok_envelope(invoke(loaded, cmd, full, opts.surface, session, agent, extra=extra))
     except ArgError as e:
         event = e.code if e.code in ("unknown_flag", "unknown_command") else "call"
         env = output.error_envelope("error", e.code, e.message,
                                     next=e.next or (f"togi {bundle_name} {cmd.name} --help" if cmd else f"togi skill {bundle_name}"))
         if event != "call":   # never a value: flag names and near-miss command words only
             vocab = {w for c in loaded.bundle.commands.values() for w in c.words}
-            extra["attempted"] = journal.sanitize_attempt(e.flag or attempted, vocab)
+            known = {p.name.replace("_", "-") for c in loaded.bundle.commands.values() for p in c.params}
+            known |= {"no-" + k for k in known}     # `--no-verbose` negates a default-true bool
+            extra["attempted"] = journal.sanitize_attempt(e.flag or attempted, vocab, known)
+            if event == "unknown_flag":
+                extra["near"] = journal.nearest_flag(e.flag, known)   # a KNOWN flag name, never the typed text
     except TogiError as e:
         env = _from_togi_error(e)
     except Exception as e:  # a bug in the command: exit 4, never a traceback in the agent's context
@@ -173,6 +289,8 @@ def call(loaded: Loaded, cmd: Command | None, args: dict[str, Any], opts: CallOp
         elif opts.cap and not opts.full:   # errors and --dry-run obey the ~8 KB cap too
             env, truncated = output.fit_any(env, output.MAX_BYTES,
                                             lambda off: _more_hint(opts.argv, loaded.name, None, opts))
+        if opts.cap and not opts.full and output._size(env) > output.MAX_BYTES:
+            env, truncated = output.hard_cap(env, output.MAX_BYTES), True   # the final guarantee, whatever got here
     out_bytes = len(output.dumps(env).encode("utf-8"))
     # ---- journal (types only, never values)
     entry = journal.make_entry(
@@ -196,6 +314,34 @@ def _from_togi_error(e: TogiError) -> dict:
     return output.error_envelope(e.status, e.code, e.message, next=e.next, **extra)
 
 
+def require_lock(loaded: Loaded) -> None:
+    """The money path checks the lock (SPEC section 2), at request time and again at use time.
+
+    A lock file that exists must verify: every locked file matches it, no symlink hides locked code, it is the lock the
+    latest signed `lock` audit entry recorded, and the audit log verifies. With NO lock file the bundle must say so
+    (`[policy] require_lock = false`); by default a bundle that has locked tiers needs one. Without this a bundle's
+    locked money code could be edited and still run, because nothing on this path ever looked at the lock.
+
+    Not applied inside the stone's own sandbox run (approvals.sandbox_optin): a throwaway home has no audit key to
+    anchor a lock with, and nothing there is real."""
+    if approvals.sandbox_optin():
+        return
+    from . import audit
+
+    loaded.refresh()
+    st = audit.lock_state(loaded.repo, loaded.manifest)
+    if st["state"] == "verified" or (st["state"] == "absent" and not loaded.manifest.lock_required()):
+        return
+    if st["state"] == "absent":
+        raise TogiError("not_locked", f"{loaded.name} has locked files but has never been locked (no "
+                                      ".togi/locked.sha256), so its gated commands are refused",
+                        next=f"a person runs, after reading the locked files: togi lock {loaded.name}   "
+                             "(a bundle with no locked code says [policy] require_lock = false)", status="refused")
+    raise TogiError("lock_check_failed", f"{loaded.name}'s lock does not verify ({st['detail']}), so its gated "
+                                         "commands are refused",
+                    next=f"review the change; a person re-locks with: togi lock {loaded.name}", status="refused")
+
+
 def _gated(loaded: Loaded, cmd: Command, full: dict, canon: dict, opts: CallOptions, session: str,
            agent: str | None, extra: dict[str, Any]) -> tuple[dict, str | None]:
     """Money (and policy-gated) effects: no valid approval -> pending request, function NOT executed."""
@@ -203,6 +349,7 @@ def _gated(loaded: Loaded, cmd: Command, full: dict, canon: dict, opts: CallOpti
     binding = loaded.binding()   # repo path + manifest version + locked-files digest, bound with command + args
     bh = approvals.binding_hash(binding)
     if not opts.approval:
+        require_lock(loaded)     # no request is even filed for a bundle whose locked code does not verify
         rec = approvals.request(loaded.name, cmd, canon, session, agent, binding)
         view = approvals.public_view(rec)
         return (output.error_envelope(
@@ -210,17 +357,19 @@ def _gated(loaded: Loaded, cmd: Command, full: dict, canon: dict, opts: CallOpti
             f"{loaded.name} {cmd.name} has effect '{cmd.effect}' and needs a person's approval; nothing was executed",
             next=f"a person runs: togi approve {rec['id']}", approval=view), None)
     try:
-        grant = approvals.check_for_use(opts.approval, loaded.name, cmd.name, h, bh)
+        grant = approvals.check_for_use(opts.approval, loaded.name, cmd.name, h, bh,
+                                        allow_test=approvals.test_approvals_allowed(loaded.manifest))
     except TogiError as e:
         if e.code == "approval_pending":  # asked but the person has not decided yet
             view = approvals.public_view(approvals.load(opts.approval))
             return output.error_envelope("needs_approval", e.code, e.message, next=e.next, approval=view), None
         raise
+    require_lock(loaded)         # ... and again at use time, before the approval is spent
     extra["approval_scope"] = grant["scope"]   # journaled: which money calls ran on a throwaway approver
-    approvals.claim(opts.approval)  # single use: taken before the function runs
+    approvals.claim(opts.approval)  # single use: recorded (outside $TOGI_HOME) before the function runs
     outcome = "error"
     try:
-        data = invoke(loaded, cmd, full, opts.surface, session, agent, approval_scope=grant["scope"])
+        data = invoke(loaded, cmd, full, opts.surface, session, agent, approval_scope=grant["scope"], extra=extra)
         outcome = "ok"
         return output.ok_envelope(data), opts.approval
     except TogiError:

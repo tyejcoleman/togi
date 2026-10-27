@@ -36,6 +36,8 @@ locked = ["togi.toml", "src/vault/engine.py"]
 
 [policy]
 approve_effects = ["money"]
+test_approvals = true     # these tests are about scope plumbing: the bundle accepts test grants and reports the scope
+require_lock = false      # ... and is not locked (the lock has its own tests)
 '''
 
 VAULT_PY = '''import os

@@ -10,7 +10,7 @@ import pytest
 from togi import mcp_bridge, registry
 from togi.errors import TogiError
 
-from conftest import clean_env, logged, togi, togi_code
+from conftest import clean_env, lock_bundle, logged, togi, togi_code
 
 mcp = pytest.importorskip("mcp")
 
@@ -48,6 +48,7 @@ def test_cli_lists_the_mcp_tools(notes, home):
 
 
 def test_call_tool_goes_through_the_host_guards(loaded, home):
+    lock_bundle("notes")      # the money path needs a verified lock
     env, err = mcp_bridge.call_tool(loaded, "notes_add", {"text": "hello", "tag": ["a"]})
     assert err is False and env["data"]["id"] == "n_1"
     env, err = mcp_bridge.call_tool(loaded, "notes_tip_send", {"id": "n_1", "amount": "5.00"})
@@ -67,6 +68,7 @@ def test_call_tool_goes_through_the_host_guards(loaded, home):
 
 
 def test_mcp_server_over_real_stdio(notes, home):
+    lock_bundle("notes")      # the money path needs a verified lock
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 

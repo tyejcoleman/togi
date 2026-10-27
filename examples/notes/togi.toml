@@ -1,0 +1,21 @@
+[bundle]
+name = "notes"
+version = "0.1.0"
+summary = "Tiny notes and tips: add, find and tip notes (a money command needs a person's approval)."
+module = "notes.togi_bundle:bundle"
+skills = "skills"
+
+[tiers]
+polish  = ["skills/**", "togi_messages.toml"]
+reshape = ["src/notes/format.py"]
+locked  = ["togi.toml", "stone/**", "tests/**", "src/notes/store.py", "src/notes/messages.py"]
+
+[stone]
+tests = "tests"
+tasks = "stone/tasks"
+
+[policy]
+approve_effects = ["money"]
+auto_polish = true
+apply_driver = "script"   # this offline example is judged by deterministic replays; real bundles default to "claude"
+apply_runs = 2            # minimum runs per task when `togi apply` evaluates a change (default 3)

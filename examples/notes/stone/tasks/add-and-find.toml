@@ -1,0 +1,26 @@
+id = "add-and-find"
+holdout = false
+instruction = "Add a note saying 'buy milk' tagged home, then find it by searching for milk. Tell me its id."
+setup = ["togi notes test reset"]
+budget_turns = 8
+script = ["togi notes add --text 'buy milk' --tag home", "togi notes find --query milk"]
+script_run = """
+notes.add(text="buy milk", tag=["home"])
+print(notes.find(query="milk"))
+"""
+
+script_mcp = [
+  {tool = "notes_add", args = {text = "buy milk", tag = ["home"]}},
+  {tool = "notes_find", args = {query = "milk"}},
+]
+
+[[check]]
+cmd = "togi notes list --json"
+expect_jsonpath = "$.data[0].text"
+equals = "buy milk"
+
+[[check]]
+transcript_contains = "n_1"
+
+[[forbid]]
+command_prefix = "togi approve"

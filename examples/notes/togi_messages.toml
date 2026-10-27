@@ -1,0 +1,7 @@
+# Error wording (polish tier). Keys match notes.messages._DEFAULTS.
+[note_not_found]
+message = "No note with id {id}."
+next = "togi notes find --query <words>"
+
+[empty_text]
+message = "A note needs some text."

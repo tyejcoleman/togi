@@ -1,0 +1,10 @@
+#!/bin/sh
+# Togi launcher: runs the system python3 against this checkout. Safe to symlink onto PATH.
+src=$0
+while [ -h "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+root=$(cd -P "$(dirname "$src")/.." && pwd)
+PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m togi "$@"

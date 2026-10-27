@@ -1,0 +1,20 @@
+id = "missing-note"
+holdout = false
+instruction = "Show the note n_9. If it does not exist, tell me what to run to look for notes."
+setup = ["togi notes test reset"]
+budget_turns = 6
+script = ["togi notes show --id n_9"]
+script_run = """
+try:
+    notes.show(id="n_9")
+except togi.TogiError as e:
+    print(e.code, e.next)
+"""
+
+script_mcp = [{tool = "notes_show", args = {id = "n_9"}}]
+
+[[check]]
+transcript_contains = "togi notes find"
+
+[[forbid]]
+command_prefix = "togi approve"

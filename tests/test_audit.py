@@ -9,7 +9,7 @@ import pytest
 from togi import audit
 from togi.manifest import load_manifest
 
-from conftest import PASSPHRASE, human, lock_bundle, run_in_pty, run_togi, togi, togi_code
+from conftest import PASSPHRASE, human, human_relock, lock_bundle, run_in_pty, run_togi, togi, togi_code
 
 
 def add_entries(repo: Path, n=3, bundle="notes"):
@@ -351,7 +351,7 @@ def test_a_person_can_re_anchor_a_log_whose_head_or_key_was_lost(notes, home):
     with pytest.raises(Exception) as ex:                       # ordinary writers still refuse
         add_entries(notes, 1)
     assert ex.value.code == "audit_chain_broken"
-    code, shown = human(home, ["lock", "notes"], "notes")      # `togi lock` (terminal + word + passphrase) re-anchors
+    code, shown = human_relock(home, ["lock", "notes"], "notes")   # `togi lock` re-anchors (r5: with the extra word "relock")
     assert code == 0, shown
     v = audit.verify(notes, "notes")
     assert v["ok"] and v["entries"] == 4 and v["head"] == "ok"

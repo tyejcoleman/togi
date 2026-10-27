@@ -112,7 +112,8 @@ def installed_module_paths(modules, dirs: list[str] | None = None) -> list[str]:
 
 
 def build_profile(*, tmp: str, repos: list[str], togi_home: str, home: str, strict: bool = False,
-                  also_hidden: tuple[str, ...] = (), modules=(), site: list[str] | None = None) -> str:
+                  also_hidden: tuple[str, ...] = (), modules=(), site: list[str] | None = None,
+                  readable: tuple[str, ...] = ()) -> str:
     """The SBPL profile text. All paths are resolved (the sandbox matches real paths, not symlinks). `also_hidden`
     are further paths denied outright, e.g. a $TOGI_APPROVER_HOME that is not under the user's home.
 
@@ -120,7 +121,9 @@ def build_profile(*, tmp: str, repos: list[str], togi_home: str, home: str, stri
     site-packages) must stay readable, but a bundle that is INSTALLED there (`pip install crowd`) would let a script
     `import crowd.engine` and call it directly, past every guard; so the paths inside the site directories that are those
     modules (package, metadata, editable-install finders) are denied last, like the registered repos. `site` overrides
-    the directories searched (tests); it is also added to the readable roots."""
+    the directories searched (tests); it is also added to the readable roots. `readable` are further directories whose
+    contents the process may read (the describe child reads one bundle repo and Togi's own source, see `prepare_describe`);
+    they are allowed BEFORE the hidden paths are denied, so a hidden path inside one of them stays hidden."""
     real = os.path.realpath
     tmp, togi_home, home = real(tmp), real(togi_home), real(home)
     hidden = sorted({real(r) for r in repos} | {togi_home} | {real(h) for h in also_hidden})
@@ -140,7 +143,8 @@ def build_profile(*, tmp: str, repos: list[str], togi_home: str, home: str, stri
                   "(allow file-read* " + " ".join(f"(subpath {_q(z)})" for z in STRICT_READ) + ")"]
     else:
         lines.append("(deny file-read* " + " ".join(f"(subpath {_q(z)})" for z in (*DENY_READ_ZONES, home)) + ")")
-    lines += [f"(allow file-read* (subpath {_q(r)}))" for r in sorted({*python_roots(), *(real(d) for d in site or [])})]
+    lines += [f"(allow file-read* (subpath {_q(r)}))"
+              for r in sorted({*python_roots(), *(real(d) for d in site or []), *(real(d) for d in readable)})]
     lines.append(f"(allow file-read* file-write* (subpath {_q(tmp)}))")
     lines.append("(deny file* " + " ".join(f"(subpath {_q(h)})" for h in hidden) + ")")
     if installed:
@@ -150,11 +154,10 @@ def build_profile(*, tmp: str, repos: list[str], togi_home: str, home: str, stri
     return "\n".join(lines) + "\n"
 
 
-def _trial(profile: str, tmp: str, home: str) -> tuple[bool, str]:
+def _trial(profile: str, tmp: str, home: str, code: str = "import socket, json, itertools, types") -> tuple[bool, str]:
     """Run Python once under `profile`; (works, why not)."""
     try:
-        p = subprocess.run([SANDBOX_EXEC, "-p", profile, sys.executable, "-I", "-B", "-c",
-                            "import socket, json, itertools, types"],
+        p = subprocess.run([SANDBOX_EXEC, "-p", profile, sys.executable, "-I", "-B", "-c", code],
                            capture_output=True, text=True, timeout=20, cwd=tmp, stdin=subprocess.DEVNULL,
                            env={"PATH": "/usr/bin:/bin", "TMPDIR": tmp, "HOME": home})
     except (OSError, subprocess.SubprocessError) as e:
@@ -187,4 +190,43 @@ def prepare(*, tmp: str, repos: list[str], togi_home: str, home: str,
         else:
             return Sandbox(False, f"sandbox-exec cannot start Python here ({detail}); it may already be inside "
                                   "another sandbox, or Python lives inside a registered bundle repo")
+    return Sandbox(False, "no sandbox profile worked")  # pragma: no cover
+
+
+# --------------------------------------------------------------------------- the describe child (r5)
+
+_DESCRIBE_OK: dict[tuple[str, bool], bool] = {}   # (python, strict) -> the profile has been seen to start Python here
+
+
+def prepare_describe(*, tmp: str, repo: str, other_repos: list[str], togi_home: str, home: str,
+                     also_hidden: tuple[str, ...] = ()) -> Sandbox:
+    """The sandbox for the child that imports ONE bundle to read what its commands are (describe.py): the same profile
+    family as `togi run`'s (no network, writes only to `tmp`, no process inspection or signals to others, `$TOGI_HOME`,
+    the approver and every OTHER registered repo hidden), except that it may also read `repo` and Togi's own source, because
+    importing the bundle is exactly what it does. Where no profile can start Python the result says not sandboxed, and the
+    caller decides whether that is acceptable (describe.run_child refuses unless a person asked for it at `togi lock`)."""
+    ok, why = available()
+    if not ok:
+        return Sandbox(False, why)
+    src = str(Path(__file__).resolve().parent.parent)
+    code = f"import sys; sys.path.insert(0, {src!r}); import togi.registry, togi.approvals"
+    note = None
+    for strict in (True, False):
+        try:
+            profile = build_profile(tmp=tmp, repos=other_repos, togi_home=togi_home, home=home, strict=strict,
+                                    also_hidden=also_hidden, readable=(repo, src))
+        except ValueError as e:
+            return Sandbox(False, f"cannot build a sandbox profile: {e}")
+        works, detail = True, ""
+        if not _DESCRIBE_OK.get((sys.executable, strict)):
+            works, detail = _trial(profile, tmp, home, code)
+            if works:
+                _DESCRIBE_OK[(sys.executable, strict)] = True
+        if works:
+            return Sandbox(True, None, [SANDBOX_EXEC, "-p", profile], "strict" if strict else "standard", note)
+        if strict:
+            note = f"strict profile unusable here ({detail}); using the standard one"
+        else:
+            return Sandbox(False, f"sandbox-exec cannot start Python here ({detail}); it may already be inside another "
+                                  "sandbox")
     return Sandbox(False, "no sandbox profile worked")  # pragma: no cover

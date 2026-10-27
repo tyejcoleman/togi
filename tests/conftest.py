@@ -51,13 +51,18 @@ REAL_PW_DIR = _real_pw_dir()          # captured at import, before any test patc
 
 def approver_files(root: Path) -> dict:
     """Every approver-related file directly inside `root` (approver, approver.key, approver.state, the spent-approval
-    record, temp files)."""
+    record, temp files), and (r5) everything inside an `approver.d` directory there: the fixed approver lives in
+    `<pw_dir>/.togi/approver.d`, so a write in the real home shows up as a change of the directory or of a file in it."""
     out = {}
     try:
         for f in root.iterdir():
             if "approver" in f.name or f.name.startswith("spent"):     # spent.jsonl / spent.head live beside the key
                 st = f.stat()
                 out[f.name] = (st.st_size, st.st_mtime_ns, st.st_ino)
+                if f.is_dir():
+                    for g in sorted(f.rglob("*")):
+                        gs = g.stat()
+                        out[f"{f.name}/{g.relative_to(f).as_posix()}"] = (gs.st_size, gs.st_mtime_ns, gs.st_ino)
     except FileNotFoundError:
         pass
     return out
@@ -136,6 +141,16 @@ def fake_pw_dir(tmp_path, monkeypatch):
         "Tests must use TOGI_APPROVER_HOME (the `home` fixture) or the `fake_pw_dir` fixture.")
 
 
+@pytest.fixture(autouse=True)
+def restore_import_hardening():
+    """`registry.harden_imports` (called whenever a bundle is loaded in-process) turns bytecode writing off and points
+    `sys.pycache_prefix` into the test's $TOGI_HOME for the rest of the process; give every test its own."""
+    saved = (sys.dont_write_bytecode, sys.pycache_prefix, list(sys.path))
+    yield
+    sys.dont_write_bytecode, sys.pycache_prefix = saved[0], saved[1]
+    sys.path[:] = saved[2]                  # the repo paths a test's bundle load added (each test has its own tmp repos)
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     h = tmp_path / "togi_home"
@@ -208,7 +223,7 @@ def default_approver(passphrase: str = PASSPHRASE) -> Path:
     from togi import approver
 
     fake = _RUNNING["fake_pw_dir"]
-    if not (fake / ".togi" / "approver").exists():
+    if not any((fake / ".togi" / n).exists() for n in ("approver.d/approver", "approver")):     # (r5 layout, or r4's)
         with mock.patch.dict(os.environ):
             os.environ.pop("TOGI_APPROVER_HOME", None)
             approver.create(passphrase, n=2 ** 10)
@@ -332,6 +347,12 @@ def human(home: Path, argv, word: str, passphrase: str = PASSPHRASE, **kw) -> tu
     return run_in_pty(home, argv, typed=answers(word, passphrase), **kw)
 
 
+def human_relock(home: Path, argv, word: str, passphrase: str = PASSPHRASE, **kw) -> tuple[int, str]:
+    """`togi lock` after something changed (or with the audit head pointer lost): the bundle name, then the extra word
+    "relock" (r5), then the passphrase."""
+    return run_in_pty(home, argv, typed=[('Type "', word), ('Type "', "relock"), ("passphrase", passphrase)], **kw)
+
+
 def human_twice(home: Path, argv, word: str, passphrase: str = PASSPHRASE, **kw) -> tuple[int, str]:
     """Two human decisions in one run (`togi apply` of a reshape proposal): approve its evaluation, then apply it."""
     return run_in_pty(home, argv, typed=answers(word, passphrase) + answers(word, passphrase), **kw)
@@ -346,7 +367,8 @@ def lock_bundle(name: str = "notes") -> dict:
 
     with mock.patch.dict(os.environ):
         os.environ.pop("TOGI_APPROVER_HOME", None)
-        return audit.lock_bundle(registry.manifest_for(name), "human:test")
+        # (the helper stands in for a person, who `togi lock`s with a sandbox, or says "unsandboxed" where there is none)
+        return audit.lock_bundle(registry.manifest_for(name), "human:test", allow_unsandboxed=True)
 
 
 # ----------------------------------------------------------------------------- a fake `claude` executable (no API calls)

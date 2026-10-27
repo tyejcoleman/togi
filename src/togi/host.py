@@ -120,10 +120,11 @@ class CappedStdout(io.TextIOBase):
         return "".join(self.parts)
 
 
-class _StdoutRouter(io.TextIOBase):
-    """`sys.stdout` while any command runs: writes from a thread that is inside `capture_stdout` go to that thread's
-    sink, everything else (the host's own output, other threads) goes to the real stdout. Needed because the MCP bridge
-    runs tool calls on worker threads at the same time, and `contextlib.redirect_stdout` swaps one global."""
+class _StreamRouter(io.TextIOBase):
+    """`sys.stdout` / `sys.stderr` while any command runs: writes from a thread that is inside `capture_stdout` /
+    `capture_stderr` go to that thread's sink, everything else (the host's own output, other threads) goes to the real
+    stream. Needed because the MCP bridge runs tool calls on worker threads at the same time, and
+    `contextlib.redirect_stdout` swaps one global."""
 
     def __init__(self, saved):
         self.saved = saved
@@ -144,20 +145,22 @@ class _StdoutRouter(io.TextIOBase):
         return getattr(self.saved, name)
 
 
+_StdoutRouter = _StreamRouter    # (r4 name)
 _ROUTE_LOCK = threading.Lock()
-_ROUTE: dict[str, Any] = {"depth": 0, "router": None, "saved": None}
+_ROUTES: dict[str, dict[str, Any]] = {"stdout": {"depth": 0, "router": None, "saved": None},
+                                      "stderr": {"depth": 0, "router": None, "saved": None}}
 
 
 @contextlib.contextmanager
-def capture_stdout(sink):
-    """Send everything the current thread writes to `sys.stdout` into `sink` while the block runs."""
+def _capture(stream: str, sink):
+    route = _ROUTES[stream]
     with _ROUTE_LOCK:
-        if _ROUTE["depth"] == 0:
-            _ROUTE["saved"] = sys.stdout
-            _ROUTE["router"] = _StdoutRouter(sys.stdout)
-            sys.stdout = _ROUTE["router"]
-        _ROUTE["depth"] += 1
-        router = _ROUTE["router"]
+        if route["depth"] == 0:
+            route["saved"] = getattr(sys, stream)
+            route["router"] = _StreamRouter(getattr(sys, stream))
+            setattr(sys, stream, route["router"])
+        route["depth"] += 1
+        router = route["router"]
     previous = getattr(router.local, "sink", None)
     router.local.sink = sink
     try:
@@ -165,11 +168,22 @@ def capture_stdout(sink):
     finally:
         router.local.sink = previous
         with _ROUTE_LOCK:
-            _ROUTE["depth"] -= 1
-            if _ROUTE["depth"] == 0:
-                if sys.stdout is router:
-                    sys.stdout = _ROUTE["saved"]
-                _ROUTE["router"] = _ROUTE["saved"] = None
+            route["depth"] -= 1
+            if route["depth"] == 0:
+                if getattr(sys, stream) is router:
+                    setattr(sys, stream, route["saved"])
+                route["router"] = route["saved"] = None
+
+
+def capture_stdout(sink):
+    """Send everything the current thread writes to `sys.stdout` into `sink` while the block runs."""
+    return _capture("stdout", sink)
+
+
+def capture_stderr(sink):
+    """Send everything the current thread writes to `sys.stderr` into `sink` while the block runs (r5: a bundle's stderr
+    is capped like its stdout; it used to go straight to the caller's stderr, unbounded)."""
+    return _capture("stderr", sink)
 
 
 def note_shape(note: dict) -> dict:
@@ -200,18 +214,23 @@ def invoke(loaded: Loaded, cmd: Command, full: dict[str, Any], surface: str, ses
         kwargs[cmd.ctx_param] = Context(bundle=loaded.name, surface=surface, agent=agent, state_dir=state,
                                         session=session, repo=loaded.repo, command=cmd.name, note_sink=sink,
                                         approval_scope=approval_scope)
-    printed = CappedStdout()
+    printed, printed_err = CappedStdout(), CappedStdout()
     try:
-        with capture_stdout(printed):
+        with capture_stdout(printed), capture_stderr(printed_err):
             result = cmd.func(**kwargs)
     finally:
-        if printed.total:   # stdout is the envelope's; what the command printed goes to stderr, capped
+        # stdout is the envelope's, and stderr is the caller's channel for Togi's own notes: what a command printed to either
+        # while it ran is bounded (first PRINT_CAP characters of each) and re-emitted on stderr with a note
+        for label, sink, key in (("stdout", printed, "printed_bytes"), ("stderr", printed_err, "printed_err_bytes")):
+            if not sink.total:
+                continue
             if extra is not None:
-                extra["printed_bytes"] = printed.total
-            cut = f" (first {printed.kept} shown)" if printed.total > printed.kept else ""
+                extra[key] = sink.total
+            cut = f" (first {sink.kept} shown)" if sink.total > sink.kept else ""
+            note = (f"[togi: {loaded.name} {cmd.name} printed {sink.total} characters to {label}{cut}; "
+                    + ("stdout is reserved for the result]" if label == "stdout" else "bounded like stdout]"))
             try:
-                sys.stderr.write(f"[togi: {loaded.name} {cmd.name} printed {printed.total} characters to stdout{cut}; "
-                                 f"stdout is reserved for the result]\n{printed.text()}\n")
+                sys.stderr.write(f"{note}\n{sink.text()}\n")
             except (OSError, ValueError):
                 pass
     return output.to_jsonable(result)
@@ -342,6 +361,30 @@ def require_lock(loaded: Loaded) -> None:
                     next=f"review the change; a person re-locks with: togi lock {loaded.name}", status="refused")
 
 
+def require_gated_code(loaded: Loaded) -> None:
+    """Every importable file behind a gated command is locked or reshape (SPEC section 2, r5).
+
+    The lock hashes the files a manifest names; what protects a money command is that the CODE it runs is among them. So,
+    wherever the lock is required: each importable file (`.py`, `.so`/`.pyd`, `.pyc`, `.pth`, package directories) under the
+    top-level package of every gated command, every symlink there, and every repo module this process has loaded, must be
+    in the locked or reshape tier. Reshape code is allowed (changing it already needs the real approver); anything untiered
+    is code nobody signed for, and the money path refuses (`gated_code_unlocked`) at request time and again at use time.
+    Not applied where no lock is required (`[policy] require_lock` / no locked tiers) or inside the stone's own sandbox,
+    for the reasons `require_lock` is not."""
+    if approvals.sandbox_optin():
+        return
+    loaded.refresh()
+    man = loaded.manifest
+    if not man.lock_required():
+        return
+    from . import codeset
+
+    problems = codeset.coverage_problems(loaded.repo, man, codeset.gated_roots_live(loaded.repo, loaded.bundle, man),
+                                         codeset.loaded_repo_files(loaded.repo))
+    if problems:
+        raise approvals.gated_code_error(loaded.name, problems)
+
+
 def _gated(loaded: Loaded, cmd: Command, full: dict, canon: dict, opts: CallOptions, session: str,
            agent: str | None, extra: dict[str, Any]) -> tuple[dict, str | None]:
     """Money (and policy-gated) effects: no valid approval -> pending request, function NOT executed."""
@@ -350,6 +393,7 @@ def _gated(loaded: Loaded, cmd: Command, full: dict, canon: dict, opts: CallOpti
     bh = approvals.binding_hash(binding)
     if not opts.approval:
         require_lock(loaded)     # no request is even filed for a bundle whose locked code does not verify
+        require_gated_code(loaded)   # ... or whose gated code is not all locked or reshape
         rec = approvals.request(loaded.name, cmd, canon, session, agent, binding)
         view = approvals.public_view(rec)
         return (output.error_envelope(
@@ -365,6 +409,7 @@ def _gated(loaded: Loaded, cmd: Command, full: dict, canon: dict, opts: CallOpti
             return output.error_envelope("needs_approval", e.code, e.message, next=e.next, approval=view), None
         raise
     require_lock(loaded)         # ... and again at use time, before the approval is spent
+    require_gated_code(loaded)
     extra["approval_scope"] = grant["scope"]   # journaled: which money calls ran on a throwaway approver
     approvals.claim(opts.approval)  # single use: recorded (outside $TOGI_HOME) before the function runs
     outcome = "error"

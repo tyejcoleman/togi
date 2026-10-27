@@ -25,7 +25,7 @@ from togi import approvals, audit, paths
 from togi.manifest import load_manifest
 
 import conftest
-from conftest import (answers, approver_files, hone_script, human, human_twice, lock_bundle, make_diff,
+from conftest import (answers, approver_files, hone_script, human, human_relock, human_twice, lock_bundle, make_diff,
                       run_in_pty, run_togi, togi, togi_code)
 
 ATTACKER = "the attacker's own passphrase"
@@ -134,7 +134,8 @@ def test_editing_a_locked_file_then_locking_it_under_its_own_test_approver_is_re
     assert default_files(fake_pw_dir) == persons_approver
 
     # and the same thing with the PERSON's approver (default scope) is how a reviewed change gets locked
-    code, shown = human(home, ["lock", "notes"], "notes")
+    # (r5: the prompt lists what changed, and a changed locked file needs the extra word "relock")
+    code, shown = human_relock(home, ["lock", "notes"], "notes")
     assert code == 0, shown
     assert audit.verify_locked(notes, man)["ok"] is True
     last = audit.read(notes)[-1]
@@ -413,5 +414,5 @@ def test_the_helpers_pick_the_default_scope_for_exactly_the_repo_gates(home, fak
     assert conftest._resolve_scope(["approve", "x"], "auto", None, ()) == (None, ())
     fake, drop = conftest._resolve_scope(["lock", "notes"], "auto", None, ())
     assert fake == fake_pw_dir and drop == ("TOGI_APPROVER_HOME",)
-    assert (fake_pw_dir / ".togi" / "approver").is_file()                # made in the fake home...
+    assert (fake_pw_dir / ".togi" / "approver.d" / "approver").is_file()  # made in the fake home...
     assert default_files(conftest.REAL_PW_DIR) == conftest.REAL_APPROVER_AT_START      # ...never in the real one

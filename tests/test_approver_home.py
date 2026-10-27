@@ -111,10 +111,10 @@ def test_approver_home_is_the_password_database_home_not_home_and_not_togi_home(
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "somewhere_else"))
     monkeypatch.setenv("TOGI_HOME", str(tmp_path / "agents_choice"))
-    assert paths.approver_home() == fake_pw_dir / ".togi" == paths.fixed_approver_home()
-    assert paths.approver_path() == fake_pw_dir / ".togi" / "approver"
-    assert paths.approver_state_path() == fake_pw_dir / ".togi" / "approver.state"
-    assert paths.approver_key_path() == fake_pw_dir / ".togi" / "approver.key"
+    assert paths.approver_home() == fake_pw_dir / ".togi" / "approver.d" == paths.fixed_approver_home()   # r5: its own dir
+    assert paths.approver_path() == fake_pw_dir / ".togi" / "approver.d" / "approver"
+    assert paths.approver_state_path() == fake_pw_dir / ".togi" / "approver.d" / "approver.state"
+    assert paths.approver_key_path() == fake_pw_dir / ".togi" / "approver.d" / "approver.key"
     assert paths.approver_scope() == "default"
     assert paths.togi_home() == tmp_path / "agents_choice"             # TOGI_HOME still moves everything else
     assert paths.approver_home() != paths.togi_home()
@@ -125,7 +125,7 @@ def test_the_override_moves_the_approver_and_marks_it_test(fake_pw_dir, monkeypa
     assert paths.approver_home() == tmp_path / "throwaway" and paths.approver_scope() == "test"
     assert paths.approver_key_path() == tmp_path / "throwaway" / "approver.key"
     monkeypatch.setenv("TOGI_APPROVER_HOME", "")                         # empty is not an override
-    assert paths.approver_home() == fake_pw_dir / ".togi" and paths.approver_scope() == "default"
+    assert paths.approver_home() == fake_pw_dir / ".togi" / "approver.d" and paths.approver_scope() == "default"
 
 
 def test_setup_in_the_fixed_home_makes_the_approver_and_a_0600_key_and_scope_is_default(home, fake_pw_dir):
@@ -133,7 +133,7 @@ def test_setup_in_the_fixed_home_makes_the_approver_and_a_0600_key_and_scope_is_
     ask = [("New approver passphrase", "a passphrase for the fixed home"), ("again", "a passphrase for the fixed home")]
     code, shown = run_in_pty(home, ["approver", "setup"], typed=ask, **fixed)
     assert code == 0, shown
-    fh = fake_pw_dir / ".togi"
+    fh = fake_pw_dir / ".togi" / "approver.d"
     assert (fh / "approver").is_file() and (fh / "approver.key").is_file()
     assert (fh / "approver").stat().st_mode & 0o777 == 0o600 and (fh / "approver.key").stat().st_mode & 0o777 == 0o600
     assert len((fh / "approver.key").read_bytes()) == 32
@@ -299,7 +299,7 @@ def test_a_grant_signed_in_test_scope_is_not_honoured_by_the_default_approver(va
     approve(home, aid, "bob")
     monkeypatch.delenv("TOGI_APPROVER_HOME")                              # now this process uses the fixed approver
     approver.create(PASSPHRASE, n=2 ** 10)                                # (in the fake pw dir, never the real one)
-    assert paths.approver_home() == fake_pw_dir / ".togi"
+    assert paths.approver_home() == fake_pw_dir / ".togi" / "approver.d"
     code, out = togi_code("vault", "pay", "--to", "bob", "--approval", aid)
     assert code == 2 and out["error"]["code"] == "approval_unsigned"
 
@@ -314,7 +314,7 @@ def test_own_togi_home_plus_own_approver_over_a_pty_cannot_run_a_gated_command_a
     # The person's real approver, in the fixed home (a fake pw dir here, never the real one).
     monkeypatch.delenv("TOGI_APPROVER_HOME")
     approver.create(PASSPHRASE, n=2 ** 10)
-    fixed_home = fake_pw_dir / ".togi"
+    fixed_home = fake_pw_dir / ".togi" / "approver.d"
     persons = contents(fixed_home)
 
     fixed = dict(drop_env=("TOGI_APPROVER_HOME",), fake_pw=fake_pw_dir)  # the agent's shell: no override variable
@@ -524,7 +524,7 @@ def test_a_stone_sandbox_never_sees_the_real_approver(notes, home):
 
 def test_no_test_resolves_the_fixed_approver_to_the_real_home(home, monkeypatch, fake_pw_dir):
     monkeypatch.delenv("TOGI_APPROVER_HOME")
-    assert paths.approver_home() == fake_pw_dir / ".togi" != REAL_PW_DIR / ".togi"
+    assert paths.approver_home() == fake_pw_dir / ".togi" / "approver.d" != REAL_PW_DIR / ".togi" / "approver.d"
 
 
 def test_the_real_approver_guard_detects_a_write(tmp_path):

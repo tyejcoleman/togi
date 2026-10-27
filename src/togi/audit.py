@@ -38,11 +38,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import output, paths
+from . import approver, output, paths
 from .cli import Reply, parse_flags, _mode, _usage
 from .errors import TogiError
 from .journal import now_ts
-from .manifest import Manifest, file_sha256, locked_files, locked_symlinks, walk_files  # noqa: F401  (re-exported)
+from .manifest import (Manifest, file_sha256, locked_digest, locked_files, locked_symlinks, scan_locked,  # noqa: F401  (re-exported)
+                       walk_files)
 from .pathnorm import escape_text
 
 GENESIS = "0" * 64
@@ -366,7 +367,9 @@ def _write_head(bundle: str, entry: dict, key: bytes) -> None:
 # --------------------------------------------------------------------------- locked hashes
 
 
-def write_lock(repo: Path, man: Manifest) -> list[str]:
+def lock_text(repo: Path, man: Manifest) -> tuple[list[str], str]:
+    """(files, text of `.togi/locked.sha256`) for the lock set as it is now, WITHOUT writing anything. Refuses a repo that a
+    lock cannot pin: a symlink where locked code is (`locked_symlink`) or a locked file name with control characters."""
     links = locked_symlinks(repo, man)
     if links:   # a link standing where locked code is would be reachable but never hashed
         raise TogiError("locked_symlink", "symlink(s) stand under the locked patterns, so the locked files cannot be "
@@ -380,22 +383,36 @@ def write_lock(repo: Path, man: Manifest) -> list[str]:
             raise TogiError("unsafe_file_name", f"locked file name {escape_text(rel)!r} has control characters",
                             next="rename or delete that file, then run: togi lock " + man.name, status="refused")
     lines = [f"{file_sha256(repo / rel)}  {rel}" for rel in files]
+    return files, "\n".join(lines) + ("\n" if lines else "")
+
+
+def write_lock(repo: Path, man: Manifest) -> list[str]:
+    files, text = lock_text(repo, man)
     lp = lock_path(repo)
     lp.parent.mkdir(parents=True, exist_ok=True)
-    lp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    lp.write_text(text, encoding="utf-8")
     return files
 
 
-def verify_locked(repo: Path, man: Manifest) -> dict:
+def read_recorded(repo: Path) -> dict[str, str] | None:
+    """{path: sha256} from `.togi/locked.sha256`, or None when there is no lock file."""
     lp = lock_path(repo)
     if not lp.is_file():
-        return {"ok": False, "locked_file_present": False, "changed": [], "missing": [], "unlisted": [],
-                "problem": "no .togi/locked.sha256"}
+        return None
     recorded: dict[str, str] = {}
     for line in _read_text(lp).split("\n"):
         if line:
             h, _, rel = line.partition("  ")
             recorded[rel] = h
+    return recorded
+
+
+def verify_locked(repo: Path, man: Manifest) -> dict:
+    lp = lock_path(repo)
+    recorded = read_recorded(repo)
+    if recorded is None:
+        return {"ok": False, "locked_file_present": False, "changed": [], "missing": [], "unlisted": [],
+                "problem": "no .togi/locked.sha256"}
     changed, missing = [], []
     for rel, h in recorded.items():
         f = repo / rel
@@ -403,8 +420,8 @@ def verify_locked(repo: Path, man: Manifest) -> dict:
             missing.append(rel)
         elif file_sha256(f) != h:
             changed.append(rel)
-    unlisted = sorted(set(locked_files(repo, man)) - set(recorded))
-    links = locked_symlinks(repo, man)
+    files_now, links = scan_locked(repo, man)
+    unlisted = sorted(set(files_now) - set(recorded))
     anchored, anchor_problem = lock_anchored(repo, lp)
     ok = not (changed or missing or unlisted or links) and anchored
     out = {"ok": ok, "locked_file_present": True, "files": len(recorded), "changed": sorted(changed),
@@ -488,15 +505,149 @@ def require_trusted_chain(repo: Path, bundle: str, status: str = "error") -> Non
                         else f"a person reads the log, then re-anchors it with: togi lock {bundle}", status=status)
 
 
-def lock_bundle(man: Manifest, decided_by: str) -> dict:
-    """Record the locked hashes and log it. Called only after a person authenticated (togi lock), or by tests."""
+def lock_bundle(man: Manifest, decided_by: str, *, snapshot: Any = None, expect_digest: str | None = None,
+                allow_unsandboxed: bool = False) -> dict:
+    """Record the locked hashes, the signed describe snapshot, and log it. Called only after a person authenticated
+    (`togi lock`), or by tests.
+
+    `snapshot`: None = read the bundle's commands now, in the hardened sandboxed child (describe.snapshot_in_child); if there
+    is no OS sandbox on this machine none is recorded rather than running the bundle outside one, and `approve` reads the
+    bundle in a sandbox when it needs to (never here: a library call does not run untrusted code unsandboxed). A
+    `(body, info)` pair = already read (`togi lock` reads it before it asks). False = record none (a lock like r4's).
+    `allow_unsandboxed`: read the bundle without an OS sandbox when there is none (a caller that is the person, e.g. a test
+    harness standing in for one; `togi lock` asks for it with a typed word). `expect_digest`: the locked digest the person was
+    shown; if the repo's lock set changed since, nothing is written
+    (`repo_changed`). Nothing is written before the child has answered, so a bundle that cannot be read leaves the old lock."""
+    from . import describe
+
     ensure_key()
-    files = write_lock(man.repo, man)
-    text = _read_text(lock_path(man.repo))
+    files, text = lock_text(man.repo, man)
+    if expect_digest is not None and locked_digest(man.repo, man) != expect_digest:
+        raise TogiError("repo_changed", f"the locked files of {man.name} changed while you were deciding; nothing was "
+                                        "locked", next=f"read the changes again, then run: togi lock {man.name}",
+                        status="refused")
+    body, sandboxed = None, True
+    if snapshot is None:
+        try:
+            body, info = describe.snapshot_in_child(man, allow_unsandboxed=allow_unsandboxed)
+            sandboxed = bool(info.get("sandboxed"))
+        except TogiError as e:
+            if e.code != "describe_unsandboxed":
+                raise
+    elif snapshot is not False:
+        body, info = snapshot
+        sandboxed = bool(info.get("sandboxed"))
+    lp = lock_path(man.repo)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_text(text, encoding="utf-8")
     entry = append(man.repo, man.name, action="lock", proposal=None, tier="locked", files=files,
                    diff_sha256=sha256_text(text), stone_before=None, stone_after=None, decided_by=decided_by,
                    reason=f"recorded {len(files)} locked file hash(es)", anchor=True)
-    return {"locked": len(files), "file": str(lock_path(man.repo)), "audit_seq": entry["seq"]}
+    if body is not None:
+        describe.write_snapshot(man, body, sha256_text(text), sandboxed=sandboxed)
+    else:
+        describe.remove_snapshot(man.repo)
+    return {"locked": len(files), "file": str(lp), "audit_seq": entry["seq"], "describe_snapshot": body is not None,
+            "commands": len(body["commands"]) if body else None}
+
+
+# --------------------------------------------------------------------------- what the lock prompt shows (M2)
+
+MAX_LISTED = 12
+
+
+def _size(repo: Path, rel: str) -> str:
+    try:
+        return f"{(repo / rel).stat().st_size} bytes"
+    except OSError:
+        return "unreadable"
+
+
+def lock_review(man: Manifest) -> dict:
+    """What a person has to see before re-locking: against the LAST lock, the locked files that changed, went missing or are
+    new (with sizes), the state of the audit head pointer, and the audit entries written since that lock. `needs_relock` is
+    true when the typed word "relock" is also required: any of those files, a missing head pointer (this machine no longer
+    remembers where the log ends) or a lock file that was deleted. `digest` is the locked digest at this moment: `lock_bundle`
+    refuses to write if it differs when the person finally confirms. A first lock (nothing to compare with) needs no extra word."""
+    repo = man.repo
+    entries = read(repo)
+    last = max((i for i, e in enumerate(entries) if e.get("action") == "lock"), default=None)
+    since = entries[last + 1:] if last is not None else entries
+    recorded = read_recorded(repo)
+    files_now, links = scan_locked(repo, man)
+    changed = missing = new = []
+    lock_file_missing = recorded is None and last is not None
+    if recorded is not None:
+        changed = sorted(r for r, h in recorded.items() if (repo / r).is_file() and file_sha256(repo / r) != h)
+        missing = sorted(r for r in recorded if not (repo / r).is_file())
+        new = sorted(set(files_now) - set(recorded))
+    try:
+        state = verify_state(entries, load_key(), man.name)
+        head, problems = state["head"], state["problems"]
+    except TogiError as e:
+        head, problems = "unreadable", [{"seq": None, "kind": "key", "problem": e.message}]
+    return {"first": recorded is None and last is None, "lock_file_missing": lock_file_missing, "changed": changed,
+            "missing": missing, "new": new, "head": head, "problems": problems, "since": since,
+            "last_lock": entries[last] if last is not None else None,
+            "needs_relock": bool(changed or missing or new or lock_file_missing or head in HEAD_RECOVERABLE),
+            "digest": locked_digest(repo, man), "files": len(files_now)}
+
+
+def lock_prompt_lines(man: Manifest, review: dict, snap: tuple[dict, dict] | None, gated_problems: list[str]) -> list[str]:
+    repo = man.repo
+
+    def listing(label: str, rels: list[str], sizes: bool) -> list[str]:
+        if not rels:
+            return []
+        out = [f"  {label}: {len(rels)}"]
+        for rel in rels[:MAX_LISTED]:
+            out.append(f"    {escape_text(rel, 120)}" + (f"  ({_size(repo, rel)})" if sizes else ""))
+        if len(rels) > MAX_LISTED:
+            out.append(f"    ... and {len(rels) - MAX_LISTED} more")
+        return out
+
+    last = review["last_lock"]
+    lines = [f"Lock bundle {escape_text(man.name, 60)}  ({escape_text(repo, 200)})",
+             f"This records the sha256 of {review['files']} locked file(s) in .togi/locked.sha256, signs an audit entry and "
+             "signs a snapshot of the bundle's commands (.togi/describe.json). Anything Python could import in place of "
+             "a locked file counts as a locked file."]
+    if review["first"]:
+        lines.append("First lock: there is no earlier lock to compare with.")
+    elif review["lock_file_missing"]:
+        lines.append("WARNING: .togi/locked.sha256 is MISSING although this bundle was locked before "
+                     f"(audit entry #{last.get('seq')}).")
+    else:
+        lines.append(f"Since the last lock (audit entry #{last.get('seq') if last else '?'}, "
+                     f"{escape_text((last or {}).get('ts', '?'), 40)}):")
+        body = (listing("changed", review["changed"], True) + listing("missing", review["missing"], False)
+                + listing("new", review["new"], True))
+        lines += body or ["  no locked file changed, went missing or is new"]
+    head = review["head"]
+    if head in HEAD_RECOVERABLE:
+        lines.append(f"audit head pointer: {head.upper()} (this machine no longer remembers where the log ends; locking "
+                     "re-anchors it, so read the log first: togi log " + man.name + ")")
+    else:
+        lines.append(f"audit head pointer: {escape_text(head, 20)}" + ("" if not review["problems"] else
+                     f"; the log has {len(review['problems'])} problem(s): "
+                     + escape_text(review["problems"][0].get("problem", "?"), 160)))
+    since = review["since"]
+    lines.append(f"audit entries since the last lock: {len(since)}")
+    for e in since[-MAX_LISTED:]:
+        lines.append("    #%s %s %s %s%s" % (escape_text(e.get("seq", "?"), 8), escape_text(e.get("ts", "?"), 30),
+                                             escape_text(e.get("action", "?"), 12), escape_text(e.get("decided_by", "?"), 40),
+                                             f" {escape_text(e['proposal'], 20)}" if e.get("proposal") else ""))
+    if len(since) > MAX_LISTED:
+        lines.append(f"    ... and {len(since) - MAX_LISTED} earlier")
+    if snap is not None:
+        body, info = snap
+        gated = [c["name"] for c in body["commands"] if c["effect"] in man.gated_effects()]
+        lines.append(f"commands read in a {info.get('level') or 'sandbox'} sandbox: {len(body['commands'])}"
+                     + (f"; gated: {escape_text(', '.join(gated), 120)}" if gated else ""))
+    if gated_problems and man.lock_required():
+        lines.append("WARNING: code behind the gated commands is neither locked nor reshape, so their money path will "
+                     f"refuse: {escape_text(', '.join(gated_problems[:5]), 200)}")
+    lines.append("Do this only after reading the diff of every locked file that changed.")
+    return lines
 
 
 def current_user() -> str:
@@ -518,7 +669,7 @@ def refuse_agents(action: str) -> None:
 
 
 def h_lock(argv: list[str]) -> Reply:
-    from . import approvals, registry
+    from . import approvals, codeset, describe, registry
 
     pos, f = parse_flags(argv, {}, "lock")
     if f["help"]:
@@ -534,12 +685,39 @@ def h_lock(argv: list[str]) -> Reply:
                         "pinned: " + ", ".join(escape_text(x, 120) for x in links[:5]),
                         next="replace each link with the real file or remove it, then run: togi lock " + man.name,
                         status="refused")
-    n = len(locked_files(man.repo, man))
-    lines = [f"Lock bundle {man.name}  ({escape_text(man.repo)})",
-             f"This records the sha256 of {n} locked file(s) in .togi/locked.sha256 and signs an audit entry.",
-             "Do this only after reading the diff of any locked file that changed."]
-    user = approvals.confirm_and_authenticate(lines, man.name, "lock", "lock")
-    data = lock_bundle(man, f"human:{user}")
+    review = lock_review(man)
+    for q in review["problems"]:     # a log that was edited cannot be re-anchored by anybody: say so before asking for anything
+        if q["kind"] in ("chain", "mac"):
+            raise TogiError("audit_chain_broken", f"refusing to lock: the audit log is broken at seq {q['seq']}: "
+                                                  f"{q['problem']}. Nothing was written.",
+                            next=f"togi log {man.name} --verify  # then restore .togi/audit.jsonl from version control",
+                            status="refused")
+    # Read the bundle's commands NOW, in the sandboxed child, so the prompt can say what is being vouched for. Where there is
+    # no OS sandbox the person is told so and asked for one more word, and the read happens only after they agreed.
+    snap, unsandboxed = None, False
+    try:
+        snap = describe.snapshot_in_child(man)
+    except TogiError as e:
+        if e.code != "describe_unsandboxed":
+            raise
+        unsandboxed = True
+    problems = codeset.coverage_problems(man.repo, man, snap[0]["gated_roots"], snap[0]["loaded_files"]) if snap else []
+    lines = lock_prompt_lines(man, review, snap, problems)
+    if unsandboxed:
+        lines.append("NO OS SANDBOX on this machine: to record the commands Togi must import the bundle outside one (own "
+                     "process, scrubbed environment, temporary directory; its code can still read what you can).")
+    user = approvals.type_confirmation(lines, man.name, "lock")
+    if review["needs_relock"]:
+        approvals.type_confirmation(
+            ["The locked files listed above differ from the last lock, or the audit head pointer is missing."],
+            "relock", "relock after reading what changed")
+    if unsandboxed:
+        approvals.type_confirmation(["Importing the bundle without an OS sandbox."], "unsandboxed",
+                                    "let the bundle be imported outside a sandbox")
+    approver.require("lock")
+    if unsandboxed:
+        snap = describe.snapshot_in_child(man, allow_unsandboxed=True)
+    data = lock_bundle(man, f"human:{user}", snapshot=snap, expect_digest=review["digest"])
     return Reply(env=output.ok_envelope(data), mode=_mode(f))
 
 

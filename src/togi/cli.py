@@ -101,12 +101,14 @@ def _usage(name: str) -> Reply:
 USAGE = {
     "skill": "togi skill [<bundle> [<topic>]] [--topics]    learn togi / a bundle / one topic\n",
     "tools": "togi tools [<bundle>] [--json]    commands as Python stubs; --json for JSON Schema\n",
-    "run": "togi run <file.py | -> [--timeout S] [--full] [--json]    code mode: bundles are modules\n",
+    "run": "togi run <file.py | -> [--timeout S] [--full] [--max-output BYTES] [--json]    code mode: bundles are modules "
+           "(output is cut at 8192 bytes; --max-output raises that, never past the --full limit of 1000000)\n",
     "approve": "togi approve <id> [--ttl 15m]    a person grants an approval (terminal + typed word + passphrase)\n",
     "deny": "togi deny <id>    a person denies an approval (terminal + typed word + passphrase)\n",
     "approvals": "togi approvals [--all]    list pending approvals\n",
-    "approver": "togi approver [status | setup]    status: is the approver passphrase set up; setup: a person sets or "
-                "changes it (needs a terminal)\n",
+    "approver": "togi approver [status | setup | migrate]    status: is the approver passphrase set up; setup: a person sets or "
+                "changes it (needs a terminal); migrate: a person moves r4's loose approver files into approver.d (any human "
+                "command does it too)\n",
     "journal": "togi journal [<bundle>] [--since 24h] [--friction] [--limit N]\n",
     "stone": "togi stone <bundle> [--driver claude|script] [--model M] [--runs N] [--tasks a,b] [--surface cli|run|mcp]\n",
     "hone": "togi hone <bundle> [--model M] [--driver claude|script] [--diff FILE]    write an improvement proposal\n",
@@ -284,6 +286,8 @@ def dispatch(argv: list[str]) -> Reply:
         rest = argv[1:] if argv and argv[0] == "skill" else []
         return h_skill(rest, mode)
     cmd, rest = argv[0], argv[1:]
+    if cmd not in ("version", "--version"):
+        paths.require_safe_layout()     # $TOGI_HOME may not be, hold or sit in the approver's own directory (r5)
     handler = _HANDLERS.get(cmd)
     if handler:
         if cmd in GUARDED_COMMANDS:
@@ -519,8 +523,12 @@ def _decide(argv: list[str], decision: str) -> Reply:
 
             ttl = max(1, int(time.time() - parse_since(f["ttl"])))
         word = verified["confirm_word"] if verified else approvals.confirm_word_for_denial(rec)
-        user = approvals.confirm_and_authenticate(approvals.prompt_lines_for(rec, verified), word, decision, name)
-        rec = approvals.grant(rec["id"], decision, user, ttl, expect_hash=rec["args_hash"], verified=verified)
+        # the expiry shown is the expiry signed: computed once, here, from now + the TTL (never the requester's field)
+        import time as _time
+        expires = approvals._iso(_time.time() + (ttl if ttl else approvals.ttl_seconds())) if verified else None
+        user = approvals.confirm_and_authenticate(approvals.prompt_lines_for(rec, verified, expires), word, decision, name)
+        rec = approvals.grant(rec["id"], decision, user, ttl, expect_hash=rec["args_hash"], verified=verified,
+                              expires=expires)
     except TogiError as e:
         _host_journal(name, False, e.status, e.code)
         raise
@@ -540,6 +548,16 @@ def h_approver(argv: list[str]) -> Reply:
     sub = pos[0] if pos else "status"
     if sub == "status":
         return Reply(env=output.ok_envelope(approver.status()), mode=_mode(f))
+    if sub == "migrate" and len(pos) == 1:
+        try:
+            approvals.human_gate("approver migrate", migrate=False)
+            moved = approver.migrate_legacy() if paths.approver_override() is None else []
+        except TogiError as e:
+            _host_journal("approver migrate", False, e.status, e.code)
+            raise
+        _host_journal("approver migrate", True, "ok", None)
+        return Reply(env=output.ok_envelope({"moved": moved, "dir": str(paths.approver_home()),
+                                             "layout": approver.layout_state()["state"]}), mode=_mode(f))
     if sub != "setup" or len(pos) > 1:
         raise TogiError("bad_arg", f"unknown approver subcommand {sub!r}", next="togi approver status")
     try:

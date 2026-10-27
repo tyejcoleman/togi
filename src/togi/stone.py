@@ -140,7 +140,8 @@ class Sandbox:
         (self.root / approvals.SANDBOX_MARKER).write_text("a stone sandbox: see approvals.sandbox_optin\n")
         shim = self.bin / "togi"
         # the same isolated launch as bin/togi: python -I, Togi's src added by the launcher, no PYTHONPATH
-        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I "{paths.launcher_path()}" "$@"\n')
+        pc = " ".join(f'"{a}"' for a in paths.pycache_args(self.home))
+        shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I {pc} "{paths.launcher_path()}" "$@"\n')
         shim.chmod(0o755)
         self.agent_session = f"stone-{secrets.token_hex(4)}"
         self.harness_session = f"harness-{secrets.token_hex(4)}"
@@ -496,7 +497,8 @@ def run_tests(repo: Path, man: Manifest, timeout: float = 900) -> dict:
     env[approvals.SANDBOX_ENV] = root
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
-        p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(repo),
+        p = subprocess.run([sys.executable, *paths.pycache_args(tmp_home), "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                            "--rootdir", str(repo),
                             str(tests)], capture_output=True, text=True, cwd=repo, env=env, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"ran": True, "passed": 0, "failed": 0, "errors": 1, "skipped": 0, "total": 0, "ok": False,

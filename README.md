@@ -34,7 +34,7 @@ togi notes show --id n_9         # error: {"ok":false,"status":"error",...,"next
 
 # 5. A money command needs a person (who has set up an approver passphrase once, in their own terminal)
 togi approver setup                            # the PERSON, once, BEFORE any agent has a shell: 12+ characters, typed twice,
-                                               # not shown. The approver lives in ~/.togi (fixed; not $TOGI_HOME, not $HOME)
+                                               # not shown. The approver lives in ~/.togi/approver.d (0700; fixed; not $TOGI_HOME, not $HOME)
 togi notes tip send --id n_1 --amount 5.00     # exit 3, returns an approval id; nothing was sent
 togi approve ap_...                            # the PERSON runs this: reads the prompt, types the word, types the passphrase
 togi notes tip send --id n_1 --amount 5.00 --approval ap_...   # now it runs, once
@@ -99,7 +99,8 @@ skills = "skills"                 # SKILL.md (main) + <topic>.md files, frontmat
 [tiers]                           # globs relative to the repo; first match wins: locked > reshape > polish
 polish  = ["skills/**", "togi_messages.toml"]
 reshape = ["src/crowd/ladder.py"]
-locked  = ["togi.toml", "stone/**", "src/crowd/engine.py", "src/crowd/settle.py"]
+locked  = ["togi.toml", "stone/**", "src/crowd/engine.py", "src/crowd/settle.py",
+           "src/crowd/togi_bundle.py", "src/crowd/__init__.py"]   # the money command's own module and package: see "The code behind a money command"
 
 [stone]
 tests = "tests"                   # deterministic pytest dir
@@ -115,11 +116,25 @@ test_approvals = false            # accept grants from a throwaway (test-scope) 
 require_lock = true               # money commands need a verified `togi lock`; default true when [tiers].locked is not empty
 ```
 
+**The code behind a money command must be locked or reshape (r5).** Python imports more than the files you list: a new
+package directory `store/` beside a locked `store.py` is imported *instead of* it, so is `store.so`, so is a `.pyc`. Togi
+therefore (1) puts every such shadow of a locked file into the lock (a new one is a changed lock: the money path says
+`lock_check_failed`), and (2) requires that every importable file (`.py`, `.so`/`.pyd`, `.pyc`, `.pth`, package directories) in
+the top-level package of each money command, every symlink there and every repo module the bundle loads, is in the `locked` or
+`reshape` tier. Anything untiered there makes the money path refuse with `gated_code_unlocked`, and `togi doctor` warns, so list
+the module that defines the command (`src/crowd/togi_bundle.py`) and the package's `__init__.py` as locked, like
+`examples/notes` does. Reshape files in the package are fine (changing them needs the real approver, through `togi apply`).
+Bundles are also imported from **source only** (no bytecode is read from or written to the repo; a `.pyc` planted in
+`__pycache__` is ignored) and with their repo paths **after the standard library**, so a `json.py` in the repo cannot replace
+`json`. Bytecode inside a repo's `__pycache__` is not part of the lock: nothing Togi starts ever reads it (every Python
+child gets `-X pycache_prefix=$TOGI_HOME/pycache`), so running a locked repo's tests in place doesn't disturb the lock.
+A bare `name.pyc` beside the source is importable and stays locked.
+
 The `[policy]` keys after `auto_polish` are optional; a manifest written before they existed behaves as if they held the
 defaults shown. `test_approvals` and `require_lock` must be real TOML booleans (`"true"` or `1` is an error, not consent).
 
-Register it with `togi add <repo>`. `togi add` adds `<repo>/src` and `<repo>` to `sys.path` when the bundle is
-imported. Bundles are imported lazily, only when a command needs them, so `togi skill` stays fast.
+Register it with `togi add <repo>`. When the bundle is imported, `<repo>/src` and `<repo>` are added to `sys.path`
+(after the standard library, before site-packages). Bundles are imported lazily, only when a command needs them, so `togi skill` stays fast.
 
 **Start Togi through its launcher.** `bin/togi` runs `python3 -I src/togi/_launch.py`: Python's *isolated* mode, with no
 current directory and no `PYTHONPATH` / `PYTHON*` variable on the import path, and Togi's own `src` added explicitly. The
@@ -316,9 +331,14 @@ journal -> stone -> hone -> review -> apply -> audit log        (revert undoes a
    re-checks what `apply` does: the audit chain, that the stored diff is the one the audit log says was applied, the
    tiers, and the locked hashes before and after the write (with rollback).
 
-`togi lock <bundle>` (a person: terminal, typed word, passphrase) records the sha256 of every locked file in
-`.togi/locked.sha256` and signs a `lock` entry into the audit log; `apply`, `revert`, `doctor` and the **money path** re-check
-it. The lock file is only trusted when it is **anchored**: it must be exactly the one the latest `lock` entry in the audit
+`togi lock <bundle>` (a person: terminal, typed word, passphrase) records the sha256 of every file in the lock set (the
+locked files **and whatever Python would import in place of them**, see "The code behind a money command") in
+`.togi/locked.sha256`, signs a `lock` entry into the audit log, and records a signed **describe snapshot** of the bundle's
+commands in `.togi/describe.json` (it imports the bundle once, in a sandboxed child, to read them). Before it asks for anything
+the prompt shows the locked files **changed, missing and new since the last lock (with sizes)**, the state of the audit head
+pointer, the audit entries written since the last lock, and the commands it read; if any file differs, the lock file was
+deleted or the head pointer is missing, you must also type `relock`. `apply`, `revert`, `doctor` and the **money path** re-check
+the lock. The lock file is only trusted when it is **anchored**: it must be exactly the one the latest `lock` entry in the audit
 log recorded, and that entry must be genuine (its hash matches its content, it carries this machine's key id and a valid
 mac). Editing a locked file and rewriting `locked.sha256` to match leaves it unanchored, and everything that relies on
 the lock refuses. A symlink that stands under a locked pattern (or in place of a locked directory) is reported by
@@ -342,10 +362,12 @@ togi mcp serve <bundle>                        togi add <path> [--local] | remov
 ```
 
 Every host command honours `--fields`, `--limit`/`--offset` (on lists) and the ~8 KB cap (`--full` lifts it); so do
-errors and `--dry-run` output.
+errors and `--dry-run` output. `togi run --max-output N` raises the 8192-byte cap on what a script prints, but **never past
+1,000,000 bytes**, the same ceiling `--full` has (r5: a larger `N` is clamped, not honoured).
 
 Environment: `TOGI_HOME` (default `~/.togi`; moves the registry, journals, approvals, proposals and audit key, but **not** the
-approver), `TOGI_APPROVER_HOME` (tests and the stone only: a throwaway approver; every grant it signs has `scope: "test"`,
+approver, which lives in `~/.togi/approver.d`; a `TOGI_HOME` that is, contains or sits inside the approver's directory is refused,
+except the default `~/.togi` itself), `TOGI_APPROVER_HOME` (tests and the stone only: a throwaway approver; every grant it signs has `scope: "test"`,
 see below), `TOGI_STONE_SANDBOX` (set by the stone harness for its own sandbox runs; does nothing in any other home), `TOGI_AGENT` (names the calling agent; **setting it at all, even to the
 empty string,** makes human-only commands refuse), `TOGI_PASSPHRASE_TIMEOUT` (seconds to wait for the approver
 passphrase, default 120), `TOGI_SESSION` (groups calls for `retry_of`; default is the parent shell's pid), `TOGI_APPROVAL_TTL`
@@ -387,28 +409,36 @@ What is enforced in code:
   a command-line match is a second check); an interpreter that is **isolated** (`python -I`, which is how `bin/togi` starts)
   or at least visibly clean (no `PYTHON*` variable, no current directory on `sys.path`); the typed confirmation word; and
   **the approver passphrase**.
-- **What you are shown is what is signed (r4).** The pending approval is a file the requesting agent wrote, so
+- **What you are shown is what is signed (r4, r5).** The pending approval is a file the requesting agent wrote, so
   `togi approve` does not trust it. Before it asks you anything it recomputes the arguments' hash from the arguments it is
-  about to show, the binding (repo path, version, locked-files digest) from the live repo, and the lock state from the live
-  lock; it loads the bundle in an **isolated child process** (never inside your approval session) to regenerate the summary
-  and the confirmation word from the bundle's own command; it refuses on any mismatch with the pending record
-  (`approval_tampered`, `approval_stale`, `lock_check_failed`, `not_locked`), shows the recomputed values, and signs
-  them. If the record changes between the check and the signature, nothing is signed (`approval_changed`).
+  about to show, the binding (repo path, version, lock-set digest) from the live repo, and the lock state from the live
+  lock; it recomputes the summary and the confirmation word **as plain data from the describe snapshot `togi lock` signed**
+  (r5: it imports nothing; r4 loaded the bundle in a child process, which could still run the bundle's import-time code
+  while you were about to decide); it refuses on any mismatch with the pending record (`approval_tampered`,
+  `approval_stale`, `lock_check_failed`, `not_locked`, `gated_code_unlocked`), refuses an argument too long to be shown whole
+  (`prompt_too_long`: you cannot sign what you cannot see), shows the recomputed values and **the expiry that will be signed**
+  (r5; not the one the requester wrote into the file), and signs them. If the record changes between the check and the
+  signature, nothing is signed (`approval_changed`).
 - **The approver passphrase.** A TTY check alone stops an agent using a normal shell, but an agent that can run
   `script(1)` or a pty library can give `togi approve` a terminal and type the word itself (the Opus refuter did exactly
   that). So a person sets up a passphrase once, in their own terminal: `togi approver setup` (12+ characters, typed
   twice, read from `/dev/tty` with echo off, never from a pipe). Only an scrypt hash and salt are stored, in
-  `approver` (0600). Every human-only action then asks for it after the typed word. `togi approver setup` on a machine
+  `approver` (0600, in `~/.togi/approver.d`). Every human-only action then asks for it after the typed word. `togi approver setup` on a machine
   that already has an approver asks for the *current* passphrase first and otherwise changes nothing. Wrong attempts are counted:
   five wrong, and the approver is locked for ten minutes; every attempt, right or wrong, is a line in the `_host`
   journal. With no approver set up, those actions refuse and say to run `togi approver setup`. Waiting for a passphrase
   that never comes times out (2 minutes) instead of hanging the caller.
-- **The approver lives where an agent cannot move it (r2).** The approver (`approver`, `approver.state` and the signing key
-  `approver.key`) is kept in `<pw_dir>/.togi`, where `pw_dir` is your account's home directory from the password
-  database, **not** `$HOME` and **not** `$TOGI_HOME`. In r1 it sat in `$TOGI_HOME`, an ordinary environment variable, so an
+- **The approver lives where an agent cannot move it (r2), in a directory of its own (r5).** The approver (`approver`,
+  `approver.state`, the signing key `approver.key` and the spent-approval log) is kept in `<pw_dir>/.togi/approver.d` (mode
+  0700), where `pw_dir` is your account's home directory from the password database, **not** `$HOME` and **not**
+  `$TOGI_HOME`. (r4 kept the files loose in `<pw_dir>/.togi`, which is also the default `$TOGI_HOME`, so the journals,
+  approvals and registry shared a directory with the key and the passphrase record. They move into `approver.d` once, at your
+  first human command after upgrading (or `togi approver migrate`), never from an agent session; if the same file exists in both
+  places, Togi refuses until you resolve it.) In r1 it sat in `$TOGI_HOME`, an ordinary environment variable, so an
   agent could set `TOGI_HOME=/tmp/mine`, `togi add` a bundle there, create an approver of its own with a fake terminal,
   approve its own money command and run it. Now `TOGI_HOME` moves everything *except* the approver, and the wrong-attempt
-  counter cannot be reset by starting over in a new home.
+  counter cannot be reset by starting over in a new home. A `TOGI_HOME` that equals, contains or sits inside the approver's
+  directory (other than the default `~/.togi` that holds `approver.d`) is refused (`togi_home_unsafe`).
 - **Grants are signed (r2).** When a person grants or denies, the approver key signs the record
   (`grant_mac`, an HMAC-SHA256 over id, bundle, command, args hash, binding hash, status, expiry, decider, scope and the
   `$TOGI_HOME` it was made in). `togi <bundle> … --approval ap_…` verifies the signature with the key in the approver
@@ -453,7 +483,7 @@ What is enforced in code:
   out-of-band approver). The audit key still follows `$TOGI_HOME`.
 - **Repo-changing gates take only the default approver (r3).** `togi lock`, `togi revert`, the approval to *evaluate* a
   reshape proposal and a human `togi apply` decide what code a bundle's repo may contain, so they accept only the approver
-  in `<pw_dir>/.togi` (scope `default`). While `TOGI_APPROVER_HOME` is set they refuse (`test_scope_refused`, exit 2)
+  in `<pw_dir>/.togi/approver.d` (scope `default`). While `TOGI_APPROVER_HOME` is set they refuse (`test_scope_refused`, exit 2)
   before asking for the typed word or a passphrase. In r2 they accepted a test-scope approver, and anyone can make one:
   an agent that can write a repo could edit a locked money file, set up a throwaway approver on a pseudo-terminal
   (`TOGI_APPROVER_HOME=/tmp/x togi approver setup`) and `togi lock` the modified code, which defeats the locked tier. The
@@ -492,7 +522,7 @@ What is **not** a security boundary (v0.1):
 
 - **A hostile process running as the same user with full file access** (see the threat model). Approval records,
   the audit key and head pointer, and the run registry are plain files in `$TOGI_HOME`; the approver hash and signing key
-  are plain files in `<pw_dir>/.togi`.
+  are plain files in `<pw_dir>/.togi/approver.d`.
 - **`togi run` is only as isolated as its profile.** On macOS the child runs under `sandbox-exec`: no network, file
   contents readable only from the Python install, its temp dir and OS directories (so not bundle repos / `$TOGI_HOME` /
   your home), writes only to its temp dir. That is a same-user process under a profile, not a VM, and `sandbox-exec` is
@@ -525,10 +555,28 @@ What is **not** a security boundary (v0.1):
   planted-file case, but code that has already run in such a process is not undone. A project-local `.togi/bundles.toml` in
   the current directory (or any parent) still overrides the global registry; the approval prompt and `togi lock` show the repo path
   they act on, so read it.
-- **`togi approve` runs the bundle's import-time code in a child process.** To regenerate the summary it loads the bundle
-  in an isolated child with a scrubbed environment and a temp directory, not in your session; but that child is a plain
-  same-user process (no `sandbox-exec`), so a bundle that is hostile at import time can still read your files as you.
-  The bundle is code you registered and locked; this is no wider than what an agent's own `togi <bundle> ...` call does.
+- **`togi approve` never imports the bundle (r5).** In r4 it loaded the bundle in a scrubbed child to regenerate the summary,
+  but that child was an ordinary same-user process: import-time code could write files or read your disk while you were about
+  to decide. Now the summary and the word you type are recomputed as plain data from the **describe snapshot** that `togi lock`
+  signed (`.togi/describe.json`, HMAC under the audit key, valid only for that lock and that repo path) and compared with what
+  the request filed. Reading the bundle happens only in the sandboxed child (the `togi run` strict profile family: no network,
+  writes only to its own temp dir, `$TOGI_HOME`, the approver and other repos hidden; its own session so no terminal; scrubbed
+  environment with no `run_env` values; killed as a group; time- and output-bounded): at `togi lock`, and for `approve` of a
+  bundle that has no snapshot yet. With no OS sandbox on the machine a bundle is not run outside one (`describe_unsandboxed`);
+  `togi lock` asks for one more typed word (`unsandboxed`) before importing it that way. The snapshot is only as good as the
+  audit key, a plain file in `$TOGI_HOME`: it stops an agent that can write the repo, not one that can read `$TOGI_HOME`. If a
+  reshape change alters a gated command's name, summary or parameters, the request (built from the live command) no longer
+  matches the snapshot and `approve` refuses until a person re-locks.
+- **What the r5 lock covers, and what it does not.** The lock set is every locked file plus whatever Python would import in
+  place of it; the money path additionally refuses untiered code in the package of a gated command and any untiered repo
+  module the bundle has loaded. It does **not** hash `reshape` files (they are allowed behind a money command because changing
+  one through `togi apply` needs the real approver; an agent that can write the repo directly can still edit a reshape file
+  without the digest noticing, so keep reshape code to behaviour you are content to have a person review in `git diff`), it
+  cannot see a module a gated command imports lazily from outside its package until something has loaded it (keep gated code
+  in one package), and it says nothing about code installed outside the repo (site-packages, the standard library).
+- **Bytecode and import order are Togi's, not the repo's (r5).** Bundle code is compiled from source on each start (the cost of
+  never trusting a `.pyc` found in the repo); output a bundle writes below Python (`os.write(2, ...)`, a subprocess that inherits
+  the descriptor) is not captured by the stdout/stderr caps.
 - **Proposal files are plain files in `$TOGI_HOME`.** `apply` re-classifies the diff text it actually reads, re-checks the
   locked hashes and the signed audit log, and the evaluation cache and a reshape proposal's evaluation approval are signed;
   but `meta.json`'s `status` and stored `diff_sha256` are not (an agent can edit them). That cannot make a locked file
@@ -563,13 +611,14 @@ What is **not** a security boundary (v0.1):
 ```sh
 python3 -m pytest -q            # the whole suite (2-3 minutes; it spawns real subprocesses, ptys and sandboxes)
                                 # tests never touch the real approver: each gets a throwaway TOGI_APPROVER_HOME (test scope),
-                                # the lock/revert/apply tests use a default-scope approver in a faked <pw_dir>/.togi, and a guard
-                                # fails any test that changes an approver file in the real <pw_dir>/.togi
+                                # the lock/revert/apply tests use a default-scope approver in a faked <pw_dir>/.togi/approver.d, and a guard
+                                # fails any test that changes an approver file (or approver.d) in the real <pw_dir>/.togi
 togi doctor                     # approver, sandbox, registry, imports, manifest, tiers, lock hashes, audit chain
 ```
 
-Layout: `src/togi/` (`_launch.py` the isolated launcher, `_describe.py` the child that reads a bundle's command for
-`togi approve`, `bundle.py` types + decorator, `host.py` the single execution path, `approvals.py`, `spent.py` the
+Layout: `src/togi/` (`_launch.py` the isolated launcher, `_describe.py` + `describe.py` the sandboxed child and the signed
+snapshot that replace importing a bundle in `togi approve`, `codeset.py` what Python can import from a repo (the lock set's shadows and
+the gated-code coverage check), `bundle.py` types + decorator, `host.py` the single execution path, `approvals.py`, `spent.py` the
 spent-approval record, `approver.py` the passphrase, `journal.py`, `runmode.py` + `_runchild.py` + `sandbox.py` + `runreg.py`, `stone.py`,
 `hone.py`, `apply.py`, `audit.py`, `pathnorm.py`, `patch.py`, `mcp_bridge.py`, `bench.py`, `doctor.py`, `cli.py`),
 `examples/notes/`, `tests/`.

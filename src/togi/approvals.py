@@ -22,8 +22,9 @@ test grant is worth) but never a change to what a repo may contain.
 
 What a person is shown is what gets signed: `togi approve` does not trust the pending file. It recomputes the args hash
 from the args it is about to display, the binding from the live repo, the lock state from the live lock, and the summary
-and the confirmation word from the bundle's own command (loaded in an isolated child process, never inside the person's
-session), refuses on any mismatch with the pending record, and signs what it recomputed (`verify_pending`).
+and the confirmation word as pure data from the describe snapshot that `togi lock` signed (describe.py), refuses on any
+mismatch with the pending record, and signs what it recomputed (`verify_pending`). It never imports the bundle: the only
+code that ever runs is the describe child, sandboxed, for a bundle that has no snapshot yet.
 
 A grant for a throwaway (test-scope) approver is refused unless the bundle's manifest opts in with
 `[policy] test_approvals = true` (`test_approvals_allowed`): Togi cannot know which bundles move real value, so the default
@@ -43,14 +44,13 @@ import hmac
 import json
 import os
 import secrets
-import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-from . import approver, paths, runreg, spent
+from . import approver, codeset, paths, runreg, spent
 from .errors import TogiError
 from .journal import now_ts, parse_ts
 from .pathnorm import escape_text, printable_token
@@ -414,14 +414,20 @@ def list_all(include_done: bool = False) -> list[dict]:
 # --------------------------------------------------------------------------- the human-only path
 
 
-def human_gate(action: str, *, repo: bool = False) -> None:
+def human_gate(action: str, *, repo: bool = False, migrate: bool = True) -> None:
     """Refuse unless a person is at a real terminal, in an isolated (or visibly clean) interpreter. `approve`/`deny` use
     it directly; `lock`, `revert` and `apply` pass `repo=True` (via `human_repo_gate`), which also demands the
-    default-scope approver. An agent session is `TOGI_AGENT` being set at all (even empty); `TOGI_RUN` likewise."""
+    default-scope approver. An agent session is `TOGI_AGENT` being set at all (even empty); `TOGI_RUN` likewise.
+
+    Once the person's checks have passed, r4's loose approver files are moved into `approver.d` (r5, `approver.migrate_legacy`):
+    the migration happens at the first human command after the upgrade, never in an agent's session."""
     _person_checks(action)
     if repo:
         require_default_scope(action)
     require_clean_interpreter(action)
+    paths.require_safe_layout()
+    if migrate and paths.approver_override() is None:
+        approver.migrate_legacy()
 
 
 def _person_checks(action: str) -> None:
@@ -475,7 +481,7 @@ def require_clean_interpreter(action: str) -> None:
 
 def require_default_scope(action: str) -> None:
     """The gates that change what a bundle's repo may do (`lock`, `revert`, evaluating a reshape proposal, a human
-    `apply`) accept ONLY the default-scope approver: the fixed one in `<pw_dir>/.togi`. Refused, always, while
+    `apply`) accept ONLY the default-scope approver: the fixed one in `<pw_dir>/.togi/approver.d`. Refused, always, while
     `$TOGI_APPROVER_HOME` is set: anyone can make a throwaway approver there with a pseudo-terminal, so its yes proves
     nothing about repo changes (an agent could edit a locked money file and `togi lock` it under its own approver).
     The refusal comes before any prompt, passphrase or expensive work, and names the way out."""
@@ -484,7 +490,7 @@ def require_default_scope(action: str) -> None:
     try:
         fixed = str(paths.fixed_approver_home())
     except TogiError:
-        fixed = "<pw_dir>/.togi"
+        fixed = "<pw_dir>/.togi/approver.d"
     raise TogiError("test_scope_refused",
                     f"`togi {action}` changes what a bundle's repo may do, so only the default approver ({fixed}) may "
                     "authorize it; TOGI_APPROVER_HOME is set, which makes this a throwaway test-scope approver that "
@@ -538,8 +544,8 @@ def confirm_and_authenticate(prompt_lines: list[str], word: str, action: str, pa
 
 # --------------------------------------------------------------------------- what the person sees is what is signed
 
-DESCRIBE_TIMEOUT_S = 30
-DESCRIBE_PREFIX = "TOGI-DESCRIBE "
+ARG_NAME_CAP = 60          # what the approval prompt shows of an argument's name ...
+ARG_VALUE_CAP = 300        # ... and of its value (as JSON); an argument longer than this cannot be approved (L2)
 
 
 def _tampered(aid: str, what: str) -> TogiError:
@@ -549,46 +555,27 @@ def _tampered(aid: str, what: str) -> TogiError:
                      status="refused")
 
 
-def describe_in_child(man: Any, aid: str, command: str, args: dict) -> dict:
-    """The summary and the confirmation word, as the bundle's OWN command produces them, from a child process.
+def gated_code_error(name: str, problems: list[str]) -> TogiError:
+    shown = ", ".join(escape_text(x, 120) for x in problems[:5]) + (f" (+{len(problems) - 5} more)" if len(problems) > 5 else "")
+    return TogiError("gated_code_unlocked",
+                     f"{name}: code that can run behind its gated commands is neither locked nor reshape: {shown}. A money "
+                     "command only runs code a person locked, or code that needs a person to change",
+                     next=f"add them to [tiers].locked (or reshape) in togi.toml, then a person runs: togi lock {name}",
+                     status="refused")
 
-    The bundle has to be loaded to know its command's name, summary and `confirm` parameter, and loading it runs the
-    bundle's import-time code. That must not happen inside the person's approval session (the terminal where they are
-    about to type a passphrase), so it happens in an isolated child (`python -I`) with a scrubbed environment (PATH, HOME,
-    TMPDIR, LANG, LC_*, TOGI_HOME, and the bundle's own `[policy] run_env`) and a temporary working directory. Whatever
-    it returns is untrusted text: callers compare it to the pending record, escape it, and never execute it."""
-    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "TMPDIR", "LANG") or k.startswith("LC_")}
-    env["TOGI_HOME"] = str(paths.togi_home())
-    env.update({k: os.environ[k] for k in getattr(man, "run_env", []) if k in os.environ and not k.startswith("PYTHON")})
-    req = json.dumps({"repo": str(man.repo), "bundle": man.name, "command": command, "args": args, "id": aid})
-    child = Path(__file__).resolve().with_name("_describe.py")
-    try:
-        with tempfile.TemporaryDirectory(prefix="togi-describe-") as tmp:
-            p = subprocess.run([sys.executable, "-I", "-B", str(child)], input=req, capture_output=True, text=True,
-                               timeout=DESCRIBE_TIMEOUT_S, cwd=tmp, env=env)
-    except subprocess.TimeoutExpired:
-        raise TogiError("describe_failed", f"loading {man.name} to read its command took longer than "
-                                           f"{DESCRIBE_TIMEOUT_S}s", next="togi doctor", status="refused")
-    except OSError as e:
-        raise TogiError("describe_failed", f"could not start the child that reads {man.name}'s command ({e})",
-                        next="togi doctor", status="refused")
-    line = next((ln for ln in reversed((p.stdout or "").splitlines()) if ln.startswith(DESCRIBE_PREFIX)), None)
-    try:
-        res = json.loads(line[len(DESCRIBE_PREFIX):]) if line else None
-    except ValueError:
-        res = None
-    if not isinstance(res, dict):
-        tail = ((p.stderr or "").strip().splitlines() or ["no answer"])[-1][:200]
-        raise TogiError("describe_failed", f"could not load {man.name} to read its command: {escape_text(tail, 200)}",
-                        next="togi doctor", status="refused")
-    if "error" in res:
-        err = res["error"] if isinstance(res["error"], dict) else {}
-        raise TogiError("describe_failed", f"{man.name}: {escape_text(str(err.get('message', 'failed')), 300)}",
-                        next="togi doctor", status="refused")
-    if not isinstance(res.get("summary"), str) or not isinstance(res.get("confirm_word"), str):
-        raise TogiError("describe_failed", f"{man.name} gave no usable description of its command", next="togi doctor",
-                        status="refused")
-    return res
+
+def check_prompt_fits(aid: str, args: dict) -> None:
+    """Refuse (`prompt_too_long`) an approval that has an argument the prompt would have to cut: the person cannot see what
+    they are signing. Names are cut at ARG_NAME_CAP and values (as JSON) at ARG_VALUE_CAP characters."""
+    for k, val in args.items():
+        name, shown = str(k), json.dumps(val, ensure_ascii=False, default=str)
+        if len(name) > ARG_NAME_CAP or len(shown) > ARG_VALUE_CAP:
+            raise TogiError("prompt_too_long",
+                            f"approval {aid} has an argument ({escape_text(name, 40)}) that is too long to show in full "
+                            f"(limit {ARG_VALUE_CAP} characters per value); nothing was shown for approval and nothing was "
+                            "signed, because you could not see what you were signing",
+                            next="the agent re-runs the command with a shorter value, or a person runs the command's work "
+                                 "another way", status="refused")
 
 
 def lock_line(lock: dict, man: Any) -> str:
@@ -610,12 +597,14 @@ def verify_pending(aid: str, rec: dict) -> dict:
       args, args_hash        the args to display, and their hash recomputed from them
       binding, binding_hash  repo path, manifest version and locked-files digest, recomputed from the live repo
       lock                   the lock state (audit.lock_state)
-      summary, confirm_word  from the bundle's own command (describe_in_child)
+      summary, confirm_word  recomputed as pure data from the describe snapshot `togi lock` signed (describe.py), or, for a
+                             bundle with no snapshot, from the hardened sandboxed child. The bundle is NOT imported here.
 
-    Checked before the person is asked anything: the record is internally consistent (args really hash to args_hash),
-    the bundle is registered, a test-scope approver is acceptable to it, the live bundle is still the one the request was
-    made for, its lock does not fail, and the summary and word on file are the ones its command produces."""
-    from . import audit, registry
+    Checked before the person is asked anything: the record is internally consistent (args really hash to args_hash), the
+    bundle is registered, a test-scope approver is acceptable to it, the live bundle is still the one the request was made
+    for, its lock does not fail, no argument is too long to show, the command exists, is gated and takes these arguments,
+    the code behind it is covered by the lock, and the summary and word on file are the ones recomputed."""
+    from . import audit, describe, registry
     from .manifest import ManifestError, load_manifest, locked_digest
 
     bundle, command, args = rec.get("bundle"), rec.get("command"), rec.get("args")
@@ -648,30 +637,70 @@ def verify_pending(aid: str, rec: dict) -> dict:
         raise TogiError("lock_check_failed" if lock["state"] == "failed" else "not_locked",
                         f"{bundle}: {lock_line(lock, man)}. Its money commands are refused until the lock verifies",
                         next=f"review the change, then a person runs: togi lock {bundle}", status="refused")
-    d = describe_in_child(man, aid, command, args)
-    if d["summary"] != rec.get("summary") or d["confirm_word"] != rec.get("confirm_word"):
-        raise _tampered(aid, "its summary or confirmation word is not the one the bundle's own command produces")
+    check_prompt_fits(aid, args)
+    snap = describe.Snapshot("missing")
+    if lock["state"] == "verified":
+        snap = describe.read_snapshot(man, audit.sha256_text(audit._read_text(audit.lock_path(man.repo))))
+        if snap.state == "invalid":
+            raise TogiError("describe_snapshot_invalid", f"{bundle}: the describe snapshot .togi/describe.json cannot be "
+                                                         f"trusted: {snap.why}", next=f"a person runs: togi lock {bundle}",
+                            status="refused")
+    if snap.ok:
+        cmd = describe.views(snap.doc).get(command)
+        roots, loaded = snap.doc["gated_roots"], snap.doc["loaded_files"]
+        source = "the signed snapshot from `togi lock`"
+    else:
+        d = describe.command_in_child(man, command)     # hardened + sandboxed; the bundle is never imported in this process
+        cmd = describe.view_of(d["command"]) if d.get("command") else None
+        roots, loaded = d.get("gated_roots") or [], d.get("loaded_files") or []
+        source = "a sandboxed read of the bundle (no signed snapshot: run `togi lock` to record one)"
+    if cmd is None:
+        raise _tampered(aid, f"{bundle} has no command {escape_text(command, 60)!r}"
+                             + (" in its signed snapshot (the bundle's commands changed since the last lock?)" if snap.ok else ""))
+    if cmd.effect not in man.gated_effects():
+        raise _tampered(aid, f"{escape_text(command, 60)!r} is not a gated command of {bundle}")
+    extra = sorted(k for k in args if k not in {p.name for p in cmd.params})
+    if extra:
+        raise _tampered(aid, f"it carries arguments the command does not take ({escape_text(', '.join(extra), 80)})")
+    if man.lock_required():
+        problems = codeset.coverage_problems(man.repo, man, roots, loaded)
+        if problems:
+            raise gated_code_error(bundle, problems)
+    summary, word = summarize(bundle, cmd, args), confirm_word(args, cmd, aid)
+    if summary != rec.get("summary") or word != rec.get("confirm_word"):
+        raise _tampered(aid, "its summary or confirmation word is not the one the bundle's own command produces"
+                             + (" (or the command changed since the last `togi lock`)" if snap.ok else ""))
     return {"args": args, "args_hash": rec["args_hash"], "binding": binding, "binding_hash": bh, "lock": lock,
-            "summary": d["summary"], "confirm_word": d["confirm_word"], "lock_line": lock_line(lock, man)}
+            "summary": summary, "confirm_word": word, "lock_line": lock_line(lock, man), "describe_source": source}
 
 
-def prompt_lines_for(rec: dict, verified: dict | None = None) -> list[str]:
+def prompt_lines_for(rec: dict, verified: dict | None = None, expires: str | None = None) -> list[str]:
     """What a person sees before approving: every untrusted string is escaped, so nothing in a summary or an
     argument can move the cursor, recolour text or hide the real amount. With `verified` (from `verify_pending`) it
-    is built from the recomputed values, not the pending file's."""
+    is built from the recomputed values, not the pending file's, and the first line shows the expiry that WILL be signed
+    (`expires`, else now + the TTL), never the field the requester wrote into the file (r5). Without it (a denial) the
+    record is shown as filed and says so."""
     v = verified or {}
     b = v.get("binding") or rec.get("binding") or {}
     summary = v.get("summary", rec.get("summary", ""))
     args = v.get("args", rec.get("args", {}))
-    lines = [f"Approval {escape_text(rec['id'], 40)}  expires {escape_text(rec['expires'], 40)}",
+    if verified:
+        when = escape_text(expires or _iso(time.time() + ttl_seconds()), 40)
+        head = f"Approval {escape_text(rec['id'], 40)}  expires {when} if you approve"
+    else:
+        head = (f"Approval {escape_text(rec['id'], 40)}  request expires {escape_text(rec['expires'], 40)} "
+                "(as the requester wrote it)")
+    lines = [head,
              f"bundle: {escape_text(rec['bundle'], 60)}   repo: {escape_text(b.get('repo') or '(unknown)', 200)}   "
              f"version: {escape_text(b.get('version') or '?', 40)}",
              escape_text(summary, SUMMARY_CAP), "args:"]
     for k, val in args.items():
         shown = json.dumps(val, ensure_ascii=False, default=str)
-        lines.append(f"  {escape_text(k, 60)} = {escape_text(shown, 300)}")
+        lines.append(f"  {escape_text(k, ARG_NAME_CAP)} = {escape_text(shown, ARG_VALUE_CAP)}")
     if v.get("lock_line"):
         lines.append(escape_text(v["lock_line"], 300))
+    if v.get("describe_source"):
+        lines.append(escape_text(f"command read from: {v['describe_source']}", 300))
     if not verified:
         lines.append("(shown as filed by the requester; not re-checked against the bundle)")
     if paths.approver_scope() == "test":
@@ -681,12 +710,13 @@ def prompt_lines_for(rec: dict, verified: dict | None = None) -> list[str]:
 
 
 def grant(aid: str, decision: str, by: str, ttl: int | None = None, expect_hash: str | None = None,
-          verified: dict | None = None) -> dict:
+          verified: dict | None = None, expires: str | None = None) -> dict:
     """Record a person's decision. The caller (cli) has already passed human_gate + confirmation + passphrase.
     `expect_hash` is the args hash the person was shown: if the record changed since, nothing is granted.
     `verified` (from `verify_pending`, approve only) is what the person was actually shown and what is SIGNED: the
     record on disk is re-read, must still agree with it on every field the grant covers (bundle, command, args, args
-    hash, binding hash, summary, confirmation word), and is then written from the recomputed values, not its own."""
+    hash, binding hash, summary, confirmation word), and is then written from the recomputed values, not its own.
+    `expires` (an ISO time) is the expiry the person was shown at the prompt, signed exactly; without it, now + the TTL."""
     rec = load(aid)
     st = effective_status(rec)
     if st != "pending":
@@ -707,7 +737,7 @@ def grant(aid: str, decision: str, by: str, ttl: int | None = None, expect_hash:
     if decision == "approve":
         rec["status"] = "approved"
         rec["approved_at"] = now_ts()
-        rec["expires"] = _iso(now + (ttl if ttl else ttl_seconds()))
+        rec["expires"] = expires or _iso(now + (ttl if ttl else ttl_seconds()))
     else:
         rec["status"] = "denied"
         rec["denied_at"] = now_ts()

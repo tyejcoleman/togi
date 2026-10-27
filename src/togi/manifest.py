@@ -243,6 +243,7 @@ def glob_match(pattern: str, relpath: str) -> bool:
     return bool(_glob_regex(fold(pattern)).match(fold(relpath)))
 
 
+# What `walk_files` leaves out (hone, apply and doctor read repo text with it). NOT used for the lock set (r5): see `_walk_for_lock`.
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv", ".mypy_cache", ".ruff_cache",
              "dist", "build", ".tox"}
 
@@ -262,20 +263,6 @@ def walk_files(repo: Path):
             yield full.relative_to(repo).as_posix()
 
 
-def walk_symlinks(repo: Path):
-    """Yield (repo-relative posix path, is_directory) of every symlink (to a file, a directory, or nothing), with the
-    same exclusions as `walk_files`. `os.walk` lists a symlinked directory among `dirnames` without descending into
-    it, so this is the only place a link standing where a locked directory or file should be shows up."""
-    import os
-
-    for dirpath, dirnames, filenames in os.walk(repo):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.endswith(".egg-info"))
-        for name in [*dirnames, *sorted(filenames)]:
-            full = Path(dirpath) / name
-            if full.is_symlink():
-                yield full.relative_to(repo).as_posix(), full.is_dir()
-
-
 # --------------------------------------------------------------------------- locked files (shared helpers)
 
 _VOLATILE = (".togi", ".git")   # audit log / lock file / VCS: never part of the locked hash set
@@ -289,26 +276,6 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def locked_files(repo: Path, man: Manifest) -> list[str]:
-    """Repo files covered by a locked pattern, PLUS any symlink standing where locked content is (`locked_symlinks`): a
-    link is never skipped, because locked code reached through a link nobody hashed is the hole this list exists to close.
-    Callers that hash files must treat the links separately (`write_lock` refuses them, `verify_locked` fails on them).
-    A file whose NAME cannot be judged (control characters, line separators) is treated as locked, so planting one under a
-    locked directory is detected."""
-    pats = [p for p in man.locked_patterns() if not p.startswith(_VOLATILE)]
-    out = []
-    for rel in walk_files(repo):
-        try:
-            norm = normalize_relpath(rel)
-        except PathRejected:
-            out.append(rel)
-            continue
-        if any(glob_match(p, norm) for p in pats):
-            out.append(rel)
-    out.extend(rel for rel in locked_symlinks(repo, man) if rel not in out)
-    return out
-
-
 def _literal_prefix(pattern: str) -> str:
     pat = pattern.strip()
     if pat.startswith("./"):
@@ -317,41 +284,116 @@ def _literal_prefix(pattern: str) -> str:
     return fold(pat[:cut])
 
 
-def locked_symlinks(repo: Path, man: Manifest) -> list[str]:
-    """Symlinks that stand where locked content is, or could hide it: a link whose own path matches a locked
-    pattern (`src/closure/evil.py -> /tmp/x.py` is importable as locked code but is not hashed), a link to a
-    directory under a locked directory, and a link to a directory that replaces an ancestor of a locked file (a
-    symlinked `src` hides everything below it from the walk). Such a link makes the lock fail (`verify_locked`) and
-    is refused for `togi lock`, so locked code can never be reached through a path nobody hashed."""
+def _walk_for_lock(repo: Path, patterns: list[str]):
+    """Yield (repo-relative posix path, kind) for every entry that could fall under a locked pattern, kind being "file",
+    "link_file" or "link_dir". NO skip list: `__pycache__`, `build`, `dist`, `venv`, `node_modules` are walked like any other
+    directory, because a locked pattern that covers them covers what Python can import from them (r5). The only things
+    left out are the repo's own `.git` / `.togi` (volatile by design, `_VOLATILE`), bytecode (`.pyc`/`.pyo`) inside
+    `__pycache__` (never read by any process Togi starts: see registry.harden_imports and paths.pycache_args), and
+    directories that provably cannot hold a match (a pattern's literal prefix says so)."""
+    prefixes = [_literal_prefix(p) for p in patterns]
+
+    def may_match(rel_dir: str) -> bool:
+        d = fold(rel_dir) + "/"
+        return any(lp.startswith(d) or d.startswith(lp) for lp in prefixes)
+
+    for dirpath, dirnames, filenames in os.walk(repo):
+        here = Path(dirpath)
+        rel_here = here.relative_to(repo).as_posix()
+        rel_here = "" if rel_here == "." else rel_here
+        keep = []
+        for d in sorted(dirnames):
+            rel = f"{rel_here}/{d}" if rel_here else d
+            if os.path.islink(here / d):
+                yield rel, "link_dir"
+            elif not (rel in _VOLATILE) and may_match(rel):
+                keep.append(d)
+        dirnames[:] = keep
+        in_pycache = "__pycache__" in rel_here.split("/")
+        for fn in sorted(filenames):
+            if fn == ".DS_Store":
+                continue
+            if in_pycache and fn.endswith((".pyc", ".pyo")):
+                # Bytecode caches are never read by any Python process Togi starts (sys.pycache_prefix in-process,
+                # `-X pycache_prefix` for every child), so they can't change what runs; hashing them would only make
+                # every ordinary test run "break" the lock. Anything else in a __pycache__ dir is still hashed.
+                continue
+            rel = f"{rel_here}/{fn}" if rel_here else fn
+            if os.path.islink(here / fn):
+                yield rel, "link_file"
+            elif os.path.isfile(here / fn):     # (a FIFO or socket cannot be imported, and hashing one would block)
+                yield rel, "file"
+
+
+def scan_locked(repo: Path, man: Manifest) -> tuple[list[str], list[str]]:
+    """(regular files, symlinks) that make up the lock set. One walk; `locked_files` / `locked_symlinks` are views of it.
+
+    The lock set is what Python could import in place of, or as, the locked code (r5), not only the files a glob names:
+      - every file that matches a locked pattern, anywhere (no `__pycache__` / `build` / `dist` / `venv` exemption);
+      - the shadows of every locked importable file (`codeset.shadows_of`): a package directory, an extension module or
+        bytecode that would be imported instead, whatever tier the globs give it;
+      - symlinks that stand where locked content is (see `locked_symlinks`), which are never hashed as content;
+      - a file whose NAME cannot be judged (control characters, line separators), treated as locked.
+    """
+    from .codeset import importable, shadows_of
+
     pats = [p for p in man.locked_patterns() if not p.startswith(_VOLATILE)]
-    out = []
-    for rel, is_dir in walk_symlinks(repo):
+    files: set[str] = set()
+    links: set[str] = set()
+    for rel, kind in _walk_for_lock(repo, pats):
         try:
             norm = normalize_relpath(rel)
         except PathRejected:
-            out.append(rel)
+            (files if kind == "file" else links).add(rel)
             continue
-        probes = [norm, norm + "/"] if is_dir else [norm]
-        hit = any(glob_match(p, x) for p in pats for x in probes)
-        if not hit and is_dir:
-            hit = any(_literal_prefix(p).startswith(fold(norm) + "/") for p in pats)
-        if hit:
-            out.append(rel)
-    return sorted(out)
+        if kind == "file":
+            if any(glob_match(p, norm) for p in pats):
+                files.add(rel)
+        elif kind == "link_file":
+            if any(glob_match(p, norm) for p in pats):
+                links.add(rel)
+        else:   # a link to a directory: under a locked directory, or standing in place of an ancestor of locked files
+            hit = any(glob_match(p, x) for p in pats for x in (norm, norm + "/"))
+            if not hit:
+                hit = any(_literal_prefix(p).startswith(fold(norm) + "/") for p in pats)
+            if hit:
+                links.add(rel)
+    sh_files, sh_links = shadows_of(repo, sorted(f for f in files if importable(f.rsplit("/", 1)[-1])))
+    files.update(sh_files)
+    links.update(sh_links)
+    return sorted(files - links), sorted(links)
+
+
+def locked_files(repo: Path, man: Manifest) -> list[str]:
+    """Repo files in the lock set (`scan_locked`), PLUS any symlink standing where locked content is: a link is never
+    skipped, because locked code reached through a link nobody hashed is the hole this list exists to close. Callers that
+    hash files must treat the links separately (`write_lock` refuses them, `verify_locked` fails on them)."""
+    files, links = scan_locked(repo, man)
+    return sorted({*files, *links})
+
+
+def locked_symlinks(repo: Path, man: Manifest) -> list[str]:
+    """Symlinks that stand where locked content is, or could hide it: a link whose own path matches a locked
+    pattern (`src/closure/evil.py -> /tmp/x.py` is importable as locked code but is not hashed), a link to a
+    directory under a locked directory, a link to a directory that replaces an ancestor of a locked file (a
+    symlinked `src` hides everything below it from the walk), and (r5) a link standing in the place of a module that
+    would shadow a locked one. Such a link makes the lock fail (`verify_locked`) and is refused for `togi lock`, so locked
+    code can never be reached through a path nobody hashed."""
+    return scan_locked(repo, man)[1]
 
 
 def locked_digest(repo: Path, man: Manifest) -> str:
-    """One digest over the CURRENT contents of every locked file (not the recorded .togi/locked.sha256), so
-    anything bound to it (an approval) dies when locked code changes. Locked symlinks are part of it too (a link
-    appearing under a locked pattern changes the digest)."""
+    """One digest over the CURRENT contents of every file in the lock set (not the recorded .togi/locked.sha256), so
+    anything bound to it (an approval) dies when locked code changes OR when something appears that Python would import
+    instead of it. Locked symlinks are part of it too (a link appearing under a locked pattern changes the digest)."""
+    files, links = scan_locked(repo, man)
     lines = []
-    links = set(locked_symlinks(repo, man))
-    for rel in sorted(f for f in locked_files(repo, man) if f not in links):
+    for rel in files:
         try:
             lines.append(f"{file_sha256(repo / rel)}  {rel!r}")
         except OSError:
             lines.append(f"unreadable  {rel!r}")
-    for rel in sorted(links):
+    for rel in links:
         try:
             lines.append(f"symlink  {rel!r} -> {os.readlink(repo / rel)!r}")
         except OSError:

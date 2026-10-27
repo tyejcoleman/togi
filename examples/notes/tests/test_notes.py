@@ -1,6 +1,7 @@
 """Deterministic tests for the notes example bundle (the 'stone' tests).
 
-Run with: PYTHONPATH=src:../../src python3 -m pytest tests
+Run with: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:../../src python3 -m pytest tests
+(the bytecode switch matters: tests/ and the locked modules are in the lock set, which sees any __pycache__ they would get)
 """
 import pytest
 from decimal import Decimal

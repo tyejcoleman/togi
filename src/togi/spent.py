@@ -4,7 +4,7 @@ An approval is a JSON file in `$TOGI_HOME/approvals/`, and `$TOGI_HOME` is somew
 choose, with an environment variable). Its `grant_mac` covers "approved", not "approved and not yet used": flipping
 `status` from `consumed` back to `approved` and deleting the `.claimed` marker would leave a validly signed grant that
 works again. So the authoritative record of use lives OUTSIDE `$TOGI_HOME`, in the approver home (the fixed
-`<pw_dir>/.togi`, or the `TOGI_APPROVER_HOME` override of a test run), next to the key that signs grants:
+`<pw_dir>/.togi/approver.d`, or the `TOGI_APPROVER_HOME` override of a test run), next to the key that signs grants:
 
     spent.jsonl   one line per spent approval, appended under an exclusive flock
     spent.head    {n, mac}: how many lines there should be and the last mac, so a truncated log is noticed

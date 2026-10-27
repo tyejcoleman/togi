@@ -100,7 +100,9 @@ def test_tier_classification_and_implicit_locks():
     assert c("src/notes/store.py") == "locked" and c("togi.toml") == "locked"
     assert c("stone/tasks/add-and-find.toml") == "locked" and c("tests/test_notes.py") == "locked"
     assert c(".togi/audit.jsonl") == "locked" and c(".togi/locked.sha256") == "locked"
-    assert c("README.md") is None and c("src/notes/togi_bundle.py") is None
+    assert c("README.md") is None
+    # r5: the gated module and its package are locked (SPEC section 2), not left untiered
+    assert c("src/notes/togi_bundle.py") == "locked" and c("src/notes/__init__.py") == "locked"
 
 
 def test_locked_wins_over_polish_and_reshape(tmp_path):

@@ -5,10 +5,14 @@ summary = "Tiny notes and tips: add, find and tip notes (a money command needs a
 module = "notes.togi_bundle:bundle"
 skills = "skills"
 
+# The rule (SPEC section 2): every importable file of the package that holds a money command is locked or reshape.
+# `tip_send` lives in togi_bundle.py, so the module, the package's __init__ and the modules it imports are all listed:
+# a new .py / .so / package directory in src/notes/ is untiered code behind a money command, and the money path refuses it.
 [tiers]
 polish  = ["skills/**", "togi_messages.toml"]
 reshape = ["src/notes/format.py"]
-locked  = ["togi.toml", "stone/**", "tests/**", "src/notes/store.py", "src/notes/messages.py"]
+locked  = ["togi.toml", "stone/**", "tests/**", "src/notes/__init__.py", "src/notes/togi_bundle.py",
+           "src/notes/store.py", "src/notes/messages.py"]
 
 [stone]
 tests = "tests"

@@ -260,7 +260,7 @@ def execute_script(source: str, *, timeout: float = DEFAULT_TIMEOUT, max_output:
         out.sandboxed, out.sandbox_reason, out.sandbox_level = sb.sandboxed, sb.reason or sb.note, sb.level
         parent_sock, child_sock = socket.socketpair()
         proc = subprocess.Popen(
-            [*sb.prefix, sys.executable, "-I", "-B", str(child_py), str(errors_py), str(child_sock.fileno()),
+            [*sb.prefix, sys.executable, "-I", "-B", *paths.pycache_args(), str(child_py), str(errors_py), str(child_sock.fileno()),
              str(script), json.dumps(names)],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=tmp,
             env=scrubbed_env(tmp), pass_fds=(child_sock.fileno(),), start_new_session=True)
@@ -401,6 +401,14 @@ def _handle(line: bytes, sock: socket.socket, session: str, out: RunOutcome) -> 
 # --------------------------------------------------------------------------- CLI handler
 
 
+def clamp_output(requested: int | None, full: bool) -> int:
+    """The byte cap for what a script prints: `--max-output N` if given, else the default (or the `--full` limit with
+    `--full`), and never more than FULL_MAX_OUTPUT (1,000,000). `--max-output` raises the default cap but cannot lift the
+    ceiling that `--full` already has, so one flag cannot be used to pull an unbounded stream back into a context (r5)."""
+    cap = requested if requested else (FULL_MAX_OUTPUT if full else DEFAULT_MAX_OUTPUT)
+    return max(1, min(int(cap), FULL_MAX_OUTPUT))
+
+
 def h_run(argv: list[str]) -> Reply:
     pos, f = parse_flags(argv, {"timeout": "float", "max-output": "int"}, "run")
     if f["help"]:
@@ -417,7 +425,7 @@ def h_run(argv: list[str]) -> Reply:
         if not p.is_file():
             raise TogiError("path_not_found", f"no script at {pos[0]}", next="togi run <file.py | ->")
         source = p.read_text(encoding="utf-8")
-    cap = f["max_output"] or (FULL_MAX_OUTPUT if f["full"] else DEFAULT_MAX_OUTPUT)
+    cap = clamp_output(f["max_output"], f["full"])
     timeout = f["timeout"] or DEFAULT_TIMEOUT
     res = execute_script(source, timeout=timeout, max_output=cap)
     res.host_env_scrubbed = scrubbed
@@ -434,11 +442,16 @@ def h_run(argv: list[str]) -> Reply:
             return Reply(env=output.ok_envelope(data), mode="json", code=0)
         return Reply(env={**env, "data": data}, mode="json", code=res.exit_code)
     # default: exactly what the script printed, on stdout; problems on stderr
-    sys.stdout.write(res.stdout)
     if res.truncated:
-        sys.stdout.write(f"\n[togi: output cut at {cap} bytes; re-run with --full or print less]\n")
-    elif res.stdout and not res.stdout.endswith("\n"):
-        sys.stdout.write("\n")
+        # the note is part of the budget: what reaches stdout (script bytes + note) never exceeds `cap`, which never exceeds
+        # FULL_MAX_OUTPUT, so one run cannot hand back more than the --full limit
+        note = f"\n[togi: output cut at {cap} bytes; re-run with --full or print less]\n"
+        keep = res.stdout.encode("utf-8")[:max(0, cap - len(note.encode()))].decode("utf-8", "ignore")
+        sys.stdout.write(keep + note)
+    else:
+        sys.stdout.write(res.stdout)
+        if res.stdout and not res.stdout.endswith("\n"):
+            sys.stdout.write("\n")
     sys.stdout.flush()
     if not res.sandboxed:   # never silent: the person/agent should know this ran without the OS sandbox
         sys.stderr.write(f"[togi: sandboxed: false - {res.sandbox_reason}]\n")

@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import approver, audit, output, paths, registry, sandbox, stone
+from . import approver, audit, codeset, describe, output, paths, registry, sandbox, stone
 from .cli import Reply, parse_flags, _mode, _usage
 from .errors import TogiError
 from .manifest import ManifestError, glob_match, load_manifest, walk_files
@@ -41,6 +41,14 @@ def check_bundle(name: str, path: str) -> list[dict]:
         rows.append(check(f"{name}: money gate", True if "money" in man.gated_effects() else False,
                           f"gated effects: {', '.join(sorted(man.gated_effects()))}"
                           + (f"; money commands: {', '.join(money)}" if money else "")))
+        if man.lock_required():
+            bad = codeset.coverage_problems(man.repo, man, codeset.gated_roots_live(man.repo, loaded.bundle, man),
+                                            codeset.loaded_repo_files(man.repo))
+            rows.append(check(f"{name}: gated code locked", not bad,
+                              "every importable file behind the gated commands is locked or reshape" if not bad else
+                              "neither locked nor reshape (gated commands are refused with gated_code_unlocked): "
+                              + ", ".join(bad[:5]) + (f" (+{len(bad) - 5} more)" if len(bad) > 5 else ""),
+                              level="warn", next="add them to [tiers].locked (or reshape) in togi.toml, then: togi lock " + name))
         missing_ex = [c.name for c in loaded.bundle.commands.values() if not c.examples]
         rows.append(check(f"{name}: examples", not missing_ex,
                           "commands without examples: " + ", ".join(missing_ex[:5]) if missing_ex else "all commands have examples",
@@ -83,6 +91,14 @@ def check_bundle(name: str, path: str) -> list[dict]:
         rows.append(check(f"{name}: locked hashes", lock["ok"],
                           f"{lock['files']} file(s) verified" if lock["ok"] else "differs: " + ", ".join(bad[:5]),
                           next=f"review the change, then: togi lock {name}"))
+    if lock["locked_file_present"]:
+        lock_sha = audit.sha256_text(audit._read_text(audit.lock_path(p)))
+        snap = describe.read_snapshot(man, lock_sha)
+        rows.append(check(f"{name}: describe snapshot", snap.ok,
+                          "signed, for the current lock" if snap.ok else f"{snap.state}: {snap.why}; `togi approve` reads the "
+                          "bundle in a sandbox instead of using a signed record" if snap.state in ("missing", "stale") else
+                          f"{snap.state}: {snap.why}",
+                          level="error" if snap.state == "invalid" else "warn", next=f"a person runs: togi lock {name}"))
     if man.test_approvals:
         rows.append(check(f"{name}: test_approvals", False,
                           "[policy] test_approvals = true: this bundle accepts grants from a throwaway (test-scope) "
@@ -142,8 +158,27 @@ def check_host() -> list[dict]:
             rows.append(check("approver key permissions", kmode == 0o600,
                               f"mode {oct(kmode) if kmode is not None else '?'}", level="warn",
                               next=f"chmod 600 {paths.approver_key_path()}"))
+    problem = paths.layout_problem()
+    rows.append(check("TOGI_HOME apart from the approver's directory", problem is None,
+                      f"$TOGI_HOME {paths.togi_home()}, approver {paths.approver_home()}" if problem is None else problem,
+                      next="unset TOGI_HOME or point it at a directory of its own"))
+    lay = approver.layout_state()
+    if lay["state"] in ("legacy", "conflict"):
+        rows.append(check("approver files layout", False,
+                          ("r4 approver files are still loose in " + str(paths.legacy_approver_home()) + ": "
+                           + ", ".join(lay["legacy"]) + f"; they move into {paths.fixed_approver_home()} at the next human "
+                           "command") if lay["state"] == "legacy" else
+                          "the approver exists in both the r4 and the r5 location: " + ", ".join(lay.get("clash", [])),
+                          level="warn" if lay["state"] == "legacy" else "error",
+                          next="a person runs: togi approver migrate" if lay["state"] == "legacy" else
+                          "a person keeps the right one and removes the other"))
+    if paths.approver_override() is None and paths.fixed_approver_home().is_dir():
+        dmode = _perm(paths.fixed_approver_home())
+        rows.append(check("approver directory permissions", dmode == 0o700, f"mode {oct(dmode) if dmode is not None else '?'}",
+                          level="warn", next=f"chmod 700 {paths.fixed_approver_home()}"))
     legacy = paths.togi_home() / "approver"
-    if legacy != paths.approver_path() and legacy.exists():
+    r4_pending = lay["state"] in ("legacy", "conflict") and legacy == paths.legacy_approver_home() / "approver"
+    if legacy != paths.approver_path() and legacy.exists() and not r4_pending:   # (r4's files are the layout row above)
         rows.append(check("legacy approver", False,
                           f"{legacy} is an r1 approver and is no longer read: the approver lives in "
                           f"{paths.approver_home()}", level="warn",

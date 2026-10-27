@@ -2,8 +2,11 @@
 
 The approver (passphrase record, wrong-attempt state, signing key) must not be somewhere an agent can choose: an
 agent that can set an environment variable could otherwise point `TOGI_HOME` at a directory it controls, create
-its own approver there and approve its own money movement. So it lives at a fixed place, `<pw_dir>/.togi`, where
-`pw_dir` comes from the password database for the current uid -- not from `$HOME`, not from `$TOGI_HOME`.
+its own approver there and approve its own money movement. So it lives at a fixed place, `<pw_dir>/.togi/approver.d`, where
+`pw_dir` comes from the password database for the current uid -- not from `$HOME`, not from `$TOGI_HOME`. (r5: its own
+0700 directory. In r4 the files sat loose in `<pw_dir>/.togi`, which is also the default `$TOGI_HOME`, so the journals,
+approvals, registry and the approver's key and passphrase record all shared one directory. They are moved into
+`approver.d` once, under the human gate: approver.migrate_legacy.)
 
 The one override is `TOGI_APPROVER_HOME`, for tests and the stone. An approver under that override signs every
 grant with `scope: "test"` (the fixed one signs `scope: "default"`), and Togi hands that scope to the command as
@@ -55,9 +58,23 @@ def pw_dir() -> Path:
                         next="a person runs this under a normal user account", status="refused")
 
 
-def fixed_approver_home() -> Path:
-    """Where the approver always lives: `<pw_dir>/.togi`."""
+APPROVER_DIRNAME = "approver.d"
+
+
+def account_togi_dir() -> Path:
+    """`<pw_dir>/.togi`: the default `$TOGI_HOME`, and the parent of the approver's own directory. In r4 the approver's files
+    sat directly in it (`legacy_approver_home`)."""
     return pw_dir() / ".togi"
+
+
+def fixed_approver_home() -> Path:
+    """Where the approver always lives: `<pw_dir>/.togi/approver.d`, a directory of its own (0700)."""
+    return account_togi_dir() / APPROVER_DIRNAME
+
+
+def legacy_approver_home() -> Path:
+    """Where r4 kept the approver's files: loose in `<pw_dir>/.togi`. Read only to migrate them (approver.migrate_legacy)."""
+    return account_togi_dir()
 
 
 def approver_override() -> Path | None:
@@ -69,6 +86,37 @@ def approver_override() -> Path | None:
 def approver_home() -> Path:
     """The directory holding approver, approver.state and approver.key: the fixed one, unless overridden."""
     return approver_override() or fixed_approver_home()
+
+
+def layout_problem() -> str | None:
+    """Why `$TOGI_HOME` and the approver's directory may not be used together, or None. `$TOGI_HOME` is where an agent's
+    session writes (journals, pending approvals, the registry, proposals); the approver's directory is not, so the one
+    must not be, contain or sit inside the other. The single exception is the default layout itself: `$TOGI_HOME` =
+    `<pw_dir>/.togi` holds the approver's own `approver.d` as a sub-directory."""
+    try:
+        home = os.path.realpath(togi_home())
+        ad = os.path.realpath(approver_home())
+        default = os.path.realpath(account_togi_dir()) if approver_override() is None else None
+    except TogiError:
+        return None
+    if home == ad:
+        return f"$TOGI_HOME ({home}) is the approver's directory"
+    if ad.startswith(home + os.sep) and home != default:
+        return f"$TOGI_HOME ({home}) contains the approver's directory ({ad})"
+    if home.startswith(ad + os.sep):
+        return f"$TOGI_HOME ({home}) is inside the approver's directory ({ad})"
+    return None
+
+
+def require_safe_layout() -> None:
+    """Refuse (`togi_home_unsafe`) to run with a `$TOGI_HOME` that equals, contains or sits inside the approver's directory
+    (see `layout_problem`). Called for every command, so no journal, approval or registry file lands next to the key."""
+    why = layout_problem()
+    if why:
+        raise TogiError("togi_home_unsafe", f"{why}; the approver keeps its passphrase record, signing key and "
+                                            "spent-approval log in a directory of their own, apart from $TOGI_HOME",
+                        next="unset TOGI_HOME (the default is ~/.togi) or point it at a directory of its own",
+                        status="refused")
 
 
 def approver_scope() -> str:
@@ -140,6 +188,14 @@ def launcher_path() -> Path:
     return Path(__file__).resolve().parent / "_launch.py"
 
 
+def pycache_args(home: Path | str | None = None) -> list[str]:
+    """`-X pycache_prefix=...` for every Python child Togi starts: bytecode is read from and written to a Togi-owned
+    directory, never a repo's `__pycache__`. That is why repo bytecode caches can stay out of the lock set: nothing
+    Togi runs ever reads them. (Works under `-I`, unlike the PYTHONPYCACHEPREFIX variable.)"""
+    base = Path(home) if home is not None else togi_home()
+    return ["-X", f"pycache_prefix={os.path.join(os.path.abspath(str(base)), 'pycache')}"]
+
+
 def isolated_argv(args: list[str] | tuple[str, ...] = ()) -> list[str]:
     """argv that starts Togi in an ISOLATED interpreter: `python -I _launch.py ARGS`.
 
@@ -147,4 +203,4 @@ def isolated_argv(args: list[str] | tuple[str, ...] = ()) -> list[str]:
     nothing planted in the directory a person happens to be standing in (a `hmac.py`, a `json.py`) and nothing in
     `PYTHONPATH` can run inside Togi. The launcher puts Togi's own `src` on `sys.path` explicitly. Every place Togi
     starts itself (the `togi` launcher, the `togi run` host re-exec, the stone's `togi` shim and MCP server) uses this."""
-    return [sys.executable, "-I", str(launcher_path()), *args]
+    return [sys.executable, "-I", *pycache_args(), str(launcher_path()), *args]

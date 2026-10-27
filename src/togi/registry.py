@@ -9,7 +9,9 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import sys
+import sysconfig
 import tempfile
 import tomllib
 from dataclasses import dataclass
@@ -176,6 +178,55 @@ def load(name: str) -> Loaded:
     return load_repo(Path(ent.path), expect_name=name)
 
 
+# --------------------------------------------------------------------------- what a bundle's import may reach (r5)
+
+
+def harden_imports() -> None:
+    """Make importing a bundle read SOURCE only. `sys.dont_write_bytecode = True` (nothing is cached into the repo, so the
+    repo's own `__pycache__` stays whatever a person left there) and `sys.pycache_prefix` pointing at a Togi-owned directory
+    inside `$TOGI_HOME` (so Python looks for cached bytecode THERE and never beside the source): a `__pycache__/store.*.pyc`
+    planted in the repo, with the right header, is never read, and the code that runs is the code in the `.py` file that
+    the lock hashed. Cost: modules imported after this are compiled from source in each process (bundle code and any
+    standard-library module it pulls in lazily); Togi's own modules are already imported by then."""
+    sys.dont_write_bytecode = True
+    sys.pycache_prefix = os.path.join(os.path.abspath(str(togi_home())), "pycache")
+
+
+def _stdlib_entries() -> set[str]:
+    out = set()
+    for key in ("stdlib", "platstdlib"):
+        p = sysconfig.get_path(key)
+        if p:
+            out.add(os.path.realpath(p))
+            out.add(os.path.realpath(os.path.join(p, "lib-dynload")))
+    return out
+
+
+def stdlib_boundary() -> int:
+    """The index in `sys.path` just after the last standard-library entry (the zip, the stdlib directory, lib-dynload).
+    Bundle repos go there: after the standard library, so a `json.py` or `decimal.py` lying in a repo (or its `src/`)
+    cannot replace a stdlib module that Togi or the bundle imports later, and before `site-packages`, so a registered repo
+    still wins over an old installed copy of the same bundle. Without a recognisable standard library, the end."""
+    std = _stdlib_entries()
+    last = -1
+    for i, entry in enumerate(sys.path):
+        if not entry:
+            continue
+        if os.path.realpath(entry) in std or re.search(r"python\d+\.zip$", entry):
+            last = i
+    return last + 1 if last >= 0 else len(sys.path)
+
+
+def add_repo_paths(repo: Path) -> None:
+    """Put `<repo>/src` and then `<repo>` on `sys.path`, after the standard library (see `stdlib_boundary`)."""
+    wanted = [str(repo / "src"), str(repo)]
+    for p in wanted:
+        while p in sys.path:
+            sys.path.remove(p)
+    at = stdlib_boundary()
+    sys.path[at:at] = wanted
+
+
 def load_repo(repo: Path, expect_name: str | None = None) -> Loaded:
     try:
         man = load_manifest(repo)
@@ -184,14 +235,11 @@ def load_repo(repo: Path, expect_name: str | None = None) -> Loaded:
     if expect_name and man.name != expect_name:
         raise TogiError("name_mismatch", f"registry says '{expect_name}' but {man.path} says '{man.name}'",
                         next=f"togi remove {expect_name} && togi add {man.repo}")
+    harden_imports()
     key = (man.name, str(man.repo))
     if key in _CACHE:
         return _CACHE[key]
-    for p in (str(man.repo), str(man.repo / "src")):  # repo/src first on sys.path, then repo
-        if p in sys.path:
-            sys.path.remove(p)
-    sys.path.insert(0, str(man.repo))
-    sys.path.insert(0, str(man.repo / "src"))
+    add_repo_paths(man.repo)
     _purge_foreign_modules(man)
     try:
         mod = importlib.import_module(man.module_name)

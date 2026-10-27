@@ -13,9 +13,12 @@ passphrase that a person set up once with `togi approver setup` and types at the
 - grants are signed: `<approver home>/approver.key` (32 random bytes, 0600, created by setup when missing) keys an
   HMAC over every grant (see approvals.py), so a grant record that was not made by this approver is worthless.
 
-<approver home> is `<pw_dir>/.togi` -- fixed, independent of $HOME and $TOGI_HOME (see paths.py). The only
-override is $TOGI_APPROVER_HOME, for tests and the stone; grants made under it carry `scope: "test"`, and the gates
-that change a repo (lock, revert, reshape evaluation, human apply) refuse it outright: anyone can make such an approver.
+<approver home> is `<pw_dir>/.togi/approver.d` -- a 0700 directory of its own (r5), fixed, independent of $HOME and
+$TOGI_HOME (see paths.py), and holding the passphrase record, the key, the attempt state and the spent-approval log. r4 kept
+those files loose in `<pw_dir>/.togi`, beside the journals and approvals of the default $TOGI_HOME; `migrate_legacy` moves
+them in once, under the human gate. The only override is $TOGI_APPROVER_HOME, for tests and the stone (used as given, never
+re-permissioned); grants made under it carry `scope: "test"`, and the gates that change a repo (lock, revert, reshape
+evaluation, human apply) refuse it outright: anyone can make such an approver.
 
 What this does and does not stop (also in the README): it stops an agent that has a shell and a pty but not the
 passphrase, and an agent that redirects $TOGI_HOME to a directory of its own. A passphrase typed into the agent's
@@ -33,6 +36,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import select
 import sys
@@ -69,6 +73,7 @@ def load() -> dict | None:
     try:
         rec = json.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError:
+        _refuse_if_migration_pending()
         return None
     except (OSError, ValueError) as e:
         raise TogiError("approver_unreadable", f"{p} cannot be read ({e})",
@@ -100,8 +105,17 @@ def _check_strength(passphrase: str) -> None:
 
 
 def _private_dir(d: Path) -> None:
-    """Create the approver home (0700 when WE create it; an existing directory, e.g. ~/.togi, is left alone)."""
+    """Create the approver home 0700. The fixed one (`<pw_dir>/.togi/approver.d`, ours alone) is also brought back to 0700 if
+    it is looser; a `$TOGI_APPROVER_HOME` override is a directory somebody else chose (a test's, never `/tmp`), so an
+    existing one is left exactly as it is."""
+    existed = d.exists()
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if existed and paths.approver_override() is None and d == paths.fixed_approver_home():
+        try:
+            if d.stat().st_mode & 0o077:
+                os.chmod(d, 0o700)
+        except OSError:
+            pass
 
 
 def create(passphrase: str, *, n: int = DEFAULT_N, replace: bool = False) -> dict:
@@ -147,6 +161,93 @@ def check(rec: dict, passphrase: str) -> bool:
     return hmac.compare_digest(got, base64.b64decode(rec["hash"]))
 
 
+# --------------------------------------------------------------------------- the r4 -> r5 layout
+
+# r4 kept these loose in `<pw_dir>/.togi`; r5 keeps them in `<pw_dir>/.togi/approver.d`. `approver` is moved LAST: until it
+# is there the migration is not finished, so a crash half way is picked up again by the next human command.
+LEGACY_FILES = ("approver.key", "approver.state", "spent.jsonl", "spent.head")
+_LEGACY_OLD = re.compile(r"spent\.(jsonl|head)\..+\.old")
+
+
+def _legacy_names() -> list[str]:
+    """r4 approver files present in the old place (empty under a `$TOGI_APPROVER_HOME` override, which never had one)."""
+    if paths.approver_override() is not None:
+        return []
+    old = paths.legacy_approver_home()
+    names = [n for n in ("approver", *LEGACY_FILES) if (old / n).is_file()]
+    try:
+        names += sorted(f.name for f in old.iterdir() if _LEGACY_OLD.fullmatch(f.name) and f.is_file())
+    except OSError:
+        pass
+    return names
+
+
+def layout_state() -> dict:
+    """`state`: override (a test approver, no layout to migrate) | current | legacy (r4 files still loose in
+    `<pw_dir>/.togi`, to be moved) | conflict (the same file exists in both places: two approvers, and nothing here may
+    guess which is the person's). `legacy` lists the r4 files."""
+    if paths.approver_override() is not None:
+        return {"state": "override", "legacy": [], "dir": str(paths.approver_home())}
+    legacy = _legacy_names()
+    new = paths.fixed_approver_home()
+    # `approver.state` (a failure counter) is not an identity: if a stray copy exists in both places the old one wins
+    clash = [n for n in legacy if n != "approver.state" and (new / n).exists()]
+    state = "conflict" if clash else ("legacy" if legacy else "current")
+    return {"state": state, "legacy": legacy, "clash": clash, "dir": str(new)}
+
+
+def _conflict_error(st: dict) -> TogiError:
+    return TogiError("approver_conflict", f"the approver exists in two places: {', '.join(st['clash'])} in both "
+                                          f"{paths.legacy_approver_home()} (r4 layout) and {paths.fixed_approver_home()}. "
+                                          "Togi will not guess which one is yours, so every human action is refused",
+                     next="a person looks at both, keeps the right one and removes the other", status="refused")
+
+
+def _refuse_if_migration_pending() -> None:
+    """Called when a file is missing from the new place: if it is still sitting in the old one, say so (instead of the
+    misleading 'no approver set up')."""
+    try:
+        st = layout_state()
+    except TogiError:
+        return
+    if st["state"] == "legacy" and st["legacy"]:
+        raise TogiError("approver_migration_pending", f"the approver's files are still in the r4 location "
+                        f"{paths.legacy_approver_home()} ({', '.join(st['legacy'])}) and have not been moved to "
+                        f"{paths.fixed_approver_home()} yet",
+                        next="a person runs, in their own terminal, any human command (e.g. togi approver migrate); "
+                             "it moves them once", status="refused")
+    if st["state"] == "conflict":
+        raise _conflict_error(st)
+
+
+def migrate_legacy() -> list[str]:
+    """Move the r4 approver files into `approver.d`, in place and once. Called from the human gate (approvals.human_gate),
+    so only after a person's terminal checks passed. Each file is renamed (same file system, nothing copied or rewritten);
+    the passphrase record goes last. A name that exists in BOTH places is a conflict and nothing is moved. Returns the names
+    moved ([] when there was nothing to do)."""
+    st = layout_state()
+    if st["state"] == "conflict":
+        raise _conflict_error(st)
+    if st["state"] != "legacy":
+        return []
+    old, new = paths.legacy_approver_home(), paths.fixed_approver_home()
+    _private_dir(new)
+    order = [n for n in st["legacy"] if n != "approver"] + (["approver"] if "approver" in st["legacy"] else [])
+    moved = []
+    for n in order:
+        os.replace(old / n, new / n)
+        moved.append(n)
+    try:
+        os.chmod(new, 0o700)
+    except OSError:
+        pass
+    from . import journal
+
+    journal.append(None, journal.make_entry(surface="cli", bundle=None, command="approver migrate", event="approver_migrated",
+                                            ok=True, status="ok", effect="admin", files=moved))
+    return moved
+
+
 # --------------------------------------------------------------------------- the signing key
 
 
@@ -156,6 +257,7 @@ def load_key() -> bytes | None:
     try:
         raw = p.read_bytes()
     except FileNotFoundError:
+        _refuse_if_migration_pending()
         return None
     except OSError as e:
         raise TogiError("approver_key_unreadable", f"{p} cannot be read ({e})",
@@ -264,7 +366,15 @@ def lock_remaining(now: float | None = None) -> float:
 
 
 def status() -> dict:
-    rec = load()
+    layout = layout_state()
+    try:
+        rec = load()
+    except TogiError as e:
+        if e.code not in ("approver_migration_pending", "approver_conflict"):
+            raise
+        return {"configured": False, "created": None, "locked": False, "locked_for_seconds": 0, "wrong_attempts": 0,
+                "path": str(paths.approver_path()), "scope": paths.approver_scope(), "key": False, "layout": layout["state"],
+                "legacy_files": layout["legacy"], "next": e.next}
     with _State() as st:
         left = max(0.0, st.locked_until - time.time())
         failures = st.failures

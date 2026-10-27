@@ -380,7 +380,12 @@ def test_prompt_caps_the_summary_at_300_characters(tipped, home):
     code, out = togi_code("notes", "tip", "send", "--id", "n_" + "9" * 2000, "--amount", "5.00")
     rec2 = approvals.load(out["approval"]["id"])
     assert len(rec2["summary"]) <= 300 and rec2["summary"].endswith("…")
+    # r5 (L2): an argument the prompt would have to cut cannot be approved at all ...
     code, shown = human_approve(home, rec2["id"], word="5.00")
+    assert code == 2 and "prompt_too_long" in shown and approvals.load(rec2["id"])["status"] == "pending"
+    # ... but one that fits (up to 300 characters) is shown whole, in lines that stay short
+    code, out = togi_code("notes", "tip", "send", "--id", "n_" + "9" * 250, "--amount", "5.00")
+    code, shown = human_approve(home, out["approval"]["id"], word="5.00")
     assert code == 0 and max(len(l) for l in shown.splitlines()) < 700
 
 

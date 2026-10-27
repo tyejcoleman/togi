@@ -484,28 +484,31 @@ def test_m1_what_changed_between_checking_and_signing_is_not_signed(pending, hom
     assert approvals.load(pending)["status"] == "pending"
 
 
-def test_m1_the_bundle_is_loaded_in_an_isolated_scrubbed_child_never_in_the_approval_session(notes, home, notes_repo):
-    """Reading the command's summary needs the bundle's import-time code. It runs in a child with a scrubbed
-    environment, not in the process where the passphrase is typed."""
+def test_m1_the_bundle_is_never_loaded_in_the_approval_session(notes, home, notes_repo):
+    """r4: reading the command's summary needed the bundle's import-time code, so it ran in a scrubbed child. r5 (FIXES-r5
+    H2) goes further: the summary comes from the describe snapshot `togi lock` signed, so approving imports nothing at all
+    (and a bundle with no snapshot is read by a sandboxed child, tests/test_fixes_r5.py)."""
     log = home / "probe.log"
     probe = notes_repo / "src" / "notes" / "probe.py"
     probe.write_text("import json, os, sys\n"
-                     f"with open({str(log)!r}, 'a') as f:\n"
-                     "    f.write(json.dumps({'secret': os.environ.get('LEAK_CHECK'), 'isolated': sys.flags.isolated,\n"
-                     "                        'pid': os.getpid()}) + '\\n')\n")
+                     "try:\n"
+                     f"    with open({str(log)!r}, 'a') as f:\n"
+                     "        f.write(json.dumps({'secret': os.environ.get('LEAK_CHECK'), 'isolated': sys.flags.isolated,\n"
+                     "                            'pid': os.getpid()}) + '\\n')\n"
+                     "except OSError:\n"
+                     "    pass\n")
     init = notes_repo / "src" / "notes" / "__init__.py"
     init.write_text(init.read_text() + "\nfrom . import probe  # noqa: F401\n")
+    toml = notes_repo / "togi.toml"                                         # (r5: new code in the gated package is tiered)
+    toml.write_text(toml.read_text().replace('reshape = ["src/notes/format.py"]', 'reshape = ["src/notes/format.py", "src/notes/probe.py"]'))
     lock_bundle("notes")
     togi("notes", "add", "--text", "tip me")
-    aid = tip_request()
-    log.write_text("")                                                      # the request's own import is not the point
+    aid = tip_request()                                                     # (the host imports the bundle: its own job)
+    assert log.exists()
+    log.write_text("")
     code, shown = human(home, ["approve", aid], "n_1", env_extra={"LEAK_CHECK": "the-persons-secret"})
     assert code == 0, shown
-    records = [json.loads(l) for l in log.read_text().splitlines()]
-    assert records, "approve did not load the bundle at all"
-    assert all(r["isolated"] == 1 for r in records), "the bundle was imported in a non-isolated process"
-    assert all(r["secret"] is None for r in records), "the person's environment reached the bundle's import"
-    assert len({r["pid"] for r in records}) == len(records)                # one throwaway child per look
+    assert log.read_text() == "", "the bundle's import-time code ran while a person was approving"
 
 
 # ============================================================================= M2: single use is signed and kept outside $TOGI_HOME

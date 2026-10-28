@@ -70,7 +70,8 @@ def text_table(rows: dict[str, dict]) -> str:
 
 
 def run_bench(repo, *, surfaces: list[str], runs: int, model: str | None, driver: str | None,
-              task_ids: list[str] | None, task_timeout: float | None = None, max_cost: float | None = None) -> dict:
+              task_ids: list[str] | None, task_timeout: float | None = None, max_cost: float | None = None,
+              engine: str = "legacy") -> dict:
     from .manifest import load_manifest
 
     man = load_manifest(repo)
@@ -79,12 +80,20 @@ def run_bench(repo, *, surfaces: list[str], runs: int, model: str | None, driver
     task_timeout = task_timeout or DEFAULT_TASK_TIMEOUT
     max_cost = max_cost or DEFAULT_TASK_COST
     rows, results = {}, {}
-    for surface in surfaces:
-        res = stone.run_stone(repo, driver=d, model=model, runs=runs, task_ids=task_ids, surface=surface,
-                              with_tests=False, task_timeout=task_timeout, max_cost=max_cost,
-                              label=f"bench-{surface}")
-        results[surface] = res
-        rows[surface] = {**surface_row(res), "driver": d}
+    if engine == "eval":     # one eval run whose subjects are the surfaces
+        from .evals import integration
+
+        results = integration.bench_matrix(repo, surfaces=surfaces, runs=runs, model=model, driver=d, task_ids=task_ids,
+                                           task_timeout=task_timeout, max_cost=max_cost)
+        for surface in surfaces:
+            rows[surface] = {**surface_row(results[surface]), "driver": d}
+    else:
+        for surface in surfaces:
+            res = stone.run_stone(repo, driver=d, model=model, runs=runs, task_ids=task_ids, surface=surface,
+                                  with_tests=False, task_timeout=task_timeout, max_cost=max_cost,
+                                  label=f"bench-{surface}")
+            results[surface] = res
+            rows[surface] = {**surface_row(res), "driver": d}
     bid = f"bn_{time.strftime('%Y%m%d-%H%M%S')}_{secrets.token_hex(2)}"
     out = {"id": bid, "bundle": man.name, "model": model, "runs": runs, "driver": d, "task_timeout_s": task_timeout,
            "max_cost_per_task_usd": max_cost, "surfaces": rows, "best": best(rows), "text": text_table(rows)}
@@ -99,7 +108,7 @@ def h_bench(argv: list[str]) -> Reply:
     from . import registry
 
     pos, f = parse_flags(argv, {"surfaces": "str", "runs": "int", "model": "str", "driver": "str", "tasks": "str",
-                                "task-timeout": "float", "max-cost": "float"}, "bench")
+                                "task-timeout": "float", "max-cost": "float", "engine": "str"}, "bench")
     if f["help"]:
         return _usage("bench")
     if len(pos) != 1:
@@ -114,6 +123,8 @@ def h_bench(argv: list[str]) -> Reply:
         choose_driver([], surfaces, "script")        # raises the explanation
     man = registry.manifest_for(pos[0])
     only = [t for t in (f["tasks"] or "").split(",") if t] or None
+    if f["engine"] not in (None, "legacy", "eval"):
+        raise TogiError("bad_arg", "--engine must be legacy or eval", next="togi bench --help")
     out = run_bench(man.repo, surfaces=surfaces, runs=max(1, f["runs"] or 1), model=f["model"], driver=f["driver"],
-                    task_ids=only, task_timeout=f["task_timeout"], max_cost=f["max_cost"])
+                    task_ids=only, task_timeout=f["task_timeout"], max_cost=f["max_cost"], engine=f["engine"] or "legacy")
     return Reply(env=output.ok_envelope(out), mode=_mode(f))

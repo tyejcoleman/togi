@@ -26,6 +26,7 @@ from .paths import togi_home
 RESERVED_NAMES = {
     "skill", "tools", "run", "approve", "deny", "approvals", "journal", "stone", "hone", "review", "apply",
     "revert", "log", "lock", "bench", "mcp", "add", "remove", "bundles", "doctor", "help", "version", "approver",
+    "answer", "task", "eval",
 }
 
 

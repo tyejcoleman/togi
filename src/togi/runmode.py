@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import cli, host, output, paths, registry, runreg, sandbox
+from . import answers, cli, host, output, paths, registry, runreg, sandbox, taskrec
 from .cli import Reply, parse_flags, _mode, _usage
 from .errors import ArgError, TogiError
 
@@ -384,6 +384,23 @@ def _handle(line: bytes, sock: socket.socket, session: str, out: RunOutcome) -> 
         return
     if op == "describe":
         resp = describe_bundle(str(msg.get("bundle")))
+    elif op == "answer":       # togi_answer(obj) in a script: the same record `togi answer` makes
+        out.calls += 1
+        try:
+            resp = answers.envelope(answers.record(msg.get("answer"), surface="run", session=session))
+        except TogiError as e:
+            resp = output.error_envelope(e.status, e.code, e.message, next=e.next)
+    elif op == "task":         # togi_task_show() / togi_task_start(goal) / togi_task_update(done=, next=, waiting=)
+        out.calls += 1
+        try:
+            a = msg.get("args") or {}
+            done = a.get("done")
+            resp = output.ok_envelope(taskrec.run(
+                str(msg.get("sub")), goal=a.get("goal"), done=[done] if isinstance(done, str) else done,
+                next_=a.get("next"), waiting=a.get("waiting"), status=a.get("status"), force=bool(a.get("force")),
+                surface="run"))
+        except TogiError as e:
+            resp = output.error_envelope(e.status, e.code, e.message, next=e.next)
     elif op == "call":
         out.calls += 1
         try:

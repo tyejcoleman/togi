@@ -590,9 +590,16 @@ def text_summary(result: dict) -> str:
 def run_stone(repo: Path, *, driver: str = "script", model: str | None = None, runs: int = 1,
               task_ids: list[str] | None = None, surface: str = "cli", with_tests: bool = True,
               task_timeout: float = 600, max_cost: float | None = None, save: bool = True,
-              label: str | None = None, jobs: int | None = None) -> dict:
+              label: str | None = None, jobs: int | None = None, engine: str = "legacy") -> dict:
+    """`engine="eval"` runs the same tasks through the eval layer (togi.evals: the tasks imported as a suite, one default
+    subject) and returns the same result shape, so hone and apply read it unchanged."""
     from concurrent.futures import ThreadPoolExecutor
 
+    if engine == "eval":
+        from .evals import integration
+
+        return integration.run_stone_via_eval(repo, driver=driver, model=model, runs=runs, task_ids=task_ids, surface=surface,
+                                              with_tests=with_tests, task_timeout=task_timeout, max_cost=max_cost, label=label, save=save)
     man = load_manifest(repo)
     tasks = load_tasks(man, task_ids)
     rid = f"st_{time.strftime('%Y%m%d-%H%M%S')}_{secrets.token_hex(2)}"
@@ -634,7 +641,7 @@ def h_stone(argv: list[str]) -> Reply:
     from . import registry
 
     pos, f = parse_flags(argv, {"driver": "str", "model": "str", "runs": "int", "tasks": "str", "surface": "str",
-                                "no-tests": "bool", "task-timeout": "float", "max-cost": "float"}, "stone")
+                                "no-tests": "bool", "task-timeout": "float", "max-cost": "float", "engine": "str"}, "stone")
     if f["help"]:
         return _usage("stone")
     if len(pos) != 1:
@@ -648,9 +655,11 @@ def h_stone(argv: list[str]) -> Reply:
     driver = f["driver"] or default_driver(tasks, surface)
     if driver not in ("claude", "script"):
         raise TogiError("bad_arg", "--driver must be claude or script", next="togi stone --help")
+    if f["engine"] not in (None, "legacy", "eval"):
+        raise TogiError("bad_arg", "--engine must be legacy or eval", next="togi stone --help")
     result = run_stone(man.repo, driver=driver, model=f["model"], runs=max(1, f["runs"] or 1), task_ids=only,
                        surface=surface, with_tests=not f["no_tests"], task_timeout=f["task_timeout"] or 600,
-                       max_cost=f["max_cost"])
+                       max_cost=f["max_cost"], engine=f["engine"] or "legacy")
     text = text_summary(result)
     data = {"run": result["id"], "path": result.get("path"), "summary": result["summary"], "text": text,
             "failed_tasks": sorted({r["task"] for r in result["tasks"] if r.get("success") is False})}

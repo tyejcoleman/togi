@@ -114,8 +114,19 @@ def main():
         fn.__doc__ = f"{meta['summary']}\n\neffect: {meta['effect']}   signature: {meta['stub']}"
         return fn
 
+    def togi_answer(obj):
+        """Record your final structured answer (the same as `togi answer --json`). Raises togi.TogiError if it is refused."""
+        return unwrap(rpc({"op": "answer", "answer": obj}))
+
+    def task_fn(sub):
+        def fn(**kwargs):
+            return unwrap(rpc({"op": "task", "sub": sub, "args": kwargs}))
+        fn.__name__ = f"togi_task_{sub}"
+        return fn
+
     names = json.loads(names_json)
-    scope = {"__name__": "__main__", "__file__": script_path, "togi": togi}
+    scope = {"__name__": "__main__", "__file__": script_path, "togi": togi, "togi_answer": togi_answer,
+             "togi_task_show": task_fn("show"), "togi_task_start": task_fn("start"), "togi_task_update": task_fn("update")}
     for name in names:
         alias = name.replace("-", "_")
         proxy = BundleProxy(name)

@@ -12,9 +12,9 @@ from typing import Any, Callable
 from . import __version__, output, paths, registry
 from .errors import ArgError, TogiError
 
-HOST_COMMANDS = ("skill", "tools", "run", "approve", "deny", "approvals", "approver", "journal", "stone", "hone",
-                 "review", "apply", "revert", "log", "lock", "bench", "mcp", "add", "remove", "bundles", "doctor",
-                 "version", "help")
+HOST_COMMANDS = ("skill", "tools", "run", "answer", "task", "approve", "deny", "approvals", "approver", "journal", "stone",
+                 "hone", "review", "apply", "revert", "log", "lock", "bench", "eval", "mcp", "add", "remove", "bundles",
+                 "doctor", "version", "help")
 # Human-only commands. ANY invocation of these is journaled before its flags are parsed (argv shape only), so a
 # forbidden attempt is on record even when it fails to parse.
 GUARDED_COMMANDS = ("approve", "deny", "lock", "revert", "apply", "approver")
@@ -103,6 +103,14 @@ USAGE = {
     "tools": "togi tools [<bundle>] [--json]    commands as Python stubs; --json for JSON Schema\n",
     "run": "togi run <file.py | -> [--timeout S] [--full] [--max-output BYTES] [--json]    code mode: bundles are modules "
            "(output is cut at 8192 bytes; --max-output raises that, never past the --full limit of 1000000)\n",
+    "answer": "togi answer --json '<object>'    record your final structured answer (checked against the task's schema "
+              "when it has one; also --file PATH, --stdin). Fix the fields and run it again if it is refused.\n",
+    "task": "togi task start --goal \"...\" | show | update [--done \"...\"] [--next \"...\"] [--waiting \"...\"] "
+            "[--status active|blocked|done]    the task record: durable memory for long-running work. Run `togi task show` "
+            "first in every session.\n",
+    "eval": "togi eval outcome new <name> | suite import-stone <bundle> | generate <gen> --seed N --out <suite> | lock <suite> | "
+            "run --outcome O --suite S --subjects X --repeats N | report <run> | compare <a> <b> | items <run> | "
+            "audit <run> --class C | contamination --suite S [--data DIR] | runs | verdict <run>\n",
     "approve": "togi approve <id> [--ttl 15m]    a person grants an approval (terminal + typed word + passphrase)\n",
     "deny": "togi deny <id>    a person denies an approval (terminal + typed word + passphrase)\n",
     "approvals": "togi approvals [--all]    list pending approvals\n",
@@ -110,19 +118,23 @@ USAGE = {
                 "changes it (needs a terminal); migrate: a person moves r4's loose approver files into approver.d (any human "
                 "command does it too)\n",
     "journal": "togi journal [<bundle>] [--since 24h] [--friction] [--limit N]\n",
-    "stone": "togi stone <bundle> [--driver claude|script] [--model M] [--runs N] [--tasks a,b] [--surface cli|run|mcp]\n",
+    "stone": "togi stone <bundle> [--driver claude|script] [--model M] [--runs N] [--tasks a,b] [--surface cli|run|mcp] "
+             "[--engine legacy|eval]\n",
     "hone": "togi hone <bundle> [--model M] [--driver claude|script] [--diff FILE]    write an improvement proposal\n",
     "review": "togi review [<id>]    show a proposal (or list them)\n",
-    "apply": "togi apply <id> [--runs N] [--driver D] [--model M] [--dry-run]    evaluate and apply a proposal (a reshape one\n"
-             "    needs a person first to let its code run, then again to apply it)\n",
+    "apply": "togi apply <id> [--runs N] [--driver D] [--model M] [--dry-run] [--outcome FILE --suite DIR --subjects S]    evaluate and "
+             "apply a proposal (a reshape one\n    needs a person first to let its code run, then again to apply it). With --outcome the "
+             "candidate must also hold the outcome's gates on the suite's TEST split (never unseen)\n",
     "revert": "togi revert <id>    undo an applied proposal (a person: terminal + typed word + passphrase of the default "
               "approver)\n",
     "log": "togi log [<bundle>] [--verify]    the audit log of applied/rejected/reverted changes\n",
     "lock": "togi lock <bundle>    record the sha256 of every locked file (a person: terminal + typed word + passphrase "
             "of the default approver; refused while TOGI_APPROVER_HOME is set)\n",
     "bench": "togi bench <bundle> --surfaces cli,run,mcp --runs N --model M [--driver claude|script] "
-             "[--task-timeout 180] [--max-cost 0.50]   (script only for one surface)\n",
-    "mcp": "togi mcp serve <bundle>    expose commands as MCP tools over stdio\n",
+             "[--task-timeout 180] [--max-cost 0.50] [--engine legacy|eval]   (script only for one surface)\n",
+    "mcp": "togi mcp serve <bundle> [--builtins]    expose commands as MCP tools over stdio (--builtins adds the `answer` and "
+           "`task_*` tools)\n"
+           "togi mcp tools <bundle> [--builtins]    list the tools;  togi mcp call <bundle> <tool> [--args JSON]    call one\n",
     "add": "togi add <path-to-bundle-repo> [--local]\n",
     "remove": "togi remove <bundle>\n",
     "bundles": "togi bundles\n",
@@ -632,6 +644,9 @@ _HANDLERS: dict[str, Callable[[list[str]], Reply]] = {
     "journal": h_journal,
     "version": lambda a: Reply(env=output.ok_envelope({"togi": __version__}), mode=_scan_mode(a)),
     "run": _lazy("runmode", "h_run"),
+    "answer": _lazy("answers", "h_answer"),
+    "task": _lazy("taskrec", "h_task"),
+    "eval": _lazy("evals.cli", "h_eval"),
     "stone": _lazy("stone", "h_stone"),
     "hone": _lazy("hone", "h_hone"),
     "review": _lazy("apply", "h_review"),

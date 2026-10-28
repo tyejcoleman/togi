@@ -34,6 +34,10 @@ signed, an argument too long to show cannot be approved, and `togi run --max-out
 marked **(r5)**. Contract changes for bundles: a manifest with a lock must put the code behind its gated commands in `locked` or
 `reshape` (§2); the manifest needs no new key.
 
+The eval layer (2026-10-27, **§9**, designed in docs/EVAL-SPEC.md) is additive: it changes nothing in the contract of §2 and every
+existing guarantee stands. New host commands `togi answer`, `togi task` and `togi eval` (marked **(eval)**), an `--engine eval` option
+on `stone` and `bench`, an optional outcome gate on `apply`, and a long-running convention in the index skill.
+
 Togi (研ぎ, "sharpening") turns any set of capabilities into a command-line tool that AI agents can
 learn in one call, use without setup, and improve under audit.
 
@@ -455,6 +459,12 @@ Every error message says what to run next. There are no interactive prompts exce
 - **(r3)** A `host_attempt` also records `approver_scope` (`default` | `test`): which approver the attempt would have used.
 - **(r2)** A gated call that ran on an approval also records `approval` (the id) and `approval_scope`.
 - `retry_of` links a call to the same command made by the same session within 120 s after an error.
+- **(eval)** `togi answer` appends an `event: "answer"` line to the `_host` journal: ok / not ok, the field names and their types
+  (`{"answer": {"region": "str", "revenue": "int"}}`) and a hash, never a value. The values go to the answers log
+  (`state/_host/answers.jsonl`, §9.2): the agent's *output*, not what it was asked to handle. `togi task` calls are `_host`
+  commands (`task start|show|update`, effect write/read, argument types only). Inside an eval or stone sandbox only
+  (`approvals.sandbox_optin()` plus `TOGI_EVAL_RECORD=1`), a call line also carries `args_full` (the arguments, cut at 400
+  characters) and `out_preview` (the reply, cut at 600) so a trajectory can be analysed; a real home never holds them.
 - **Friction summary:** error rate per command, the top error codes, repeated retries, unknown
   flags or commands attempted, commands that produced truncated output, and `--help` lookups
   (a sign the skill is unclear).
@@ -505,6 +515,11 @@ true only when that variable names a directory with the marker whose `home` is t
 without `test_approvals` and the money path skips the lock check (a throwaway home has no audit key to anchor a lock with, and
 nothing there is real). The stone's `togi` shim and MCP server are started isolated (`paths.isolated_argv`, §3) and no longer
 use `PYTHONPATH`. A `togi run` child launched inside the sandbox inherits the variable.
+
+**(eval) `--engine eval`.** `togi stone <bundle> --engine eval` runs the same tasks through the eval layer (§9): the tasks are
+imported as a suite (`holdout` becomes split `test`, anything else `dev`; the checks become typed checks), run by the eval runner
+with one default subject, and returned in the stone's own result shape, so `hone` and `apply` read them unchanged. `bench
+--engine eval` does the same with one subject per surface. The default engine is still the original one.
 
 **Output:** a result JSON in `$TOGI_HOME/stone/<bundle>/<run-id>.json` plus a short text summary.
 
@@ -622,6 +637,14 @@ rollback), applies the reverse diff and logs it.
 
 ---
 
+**(eval) The outcome gate.** `togi apply <id> --outcome FILE --suite DIR --subjects S` adds one gate to the apply rules: the
+candidate must also hold the outcome's gates on the suite's **test** split (`integration.outcome_gate`: the suite is run for the
+current bundle and for the candidate copy; the candidate passes if it passes the gates, or the baseline failed them and the
+candidate's worst slice is no worse, with no forbidden attempts beyond the gate's allowance). The unseen split is never run here.
+A failed gate is a `reject` with reason `outcome_gate_failed`. The evaluation cache key includes the outcome arguments.
+
+---
+
 ## 7. MCP bridge
 
 `togi mcp serve <bundle>` uses `mcp.server.fastmcp` if installed. Each command becomes a tool:
@@ -635,6 +658,12 @@ answers the handshake before the bundle is imported (the bundle loads on first u
 of stdout (stray prints go to stderr), and cuts results at ~8 KB with a note.
 
 It goes through the same host execution path (guards, journal).
+
+**(eval)** `togi mcp serve <bundle> --builtins` (or `TOGI_MCP_BUILTINS=1`) also lists four host tools, the twins of the host
+commands: `answer` (its arguments ARE the answer object; its input schema is the task's answer schema when
+`$TOGI_HOME/answer-schema.json` exists), `task_start`, `task_show`, `task_update`. A plain server lists bundle tools only.
+`togi mcp tools <bundle> [--builtins]` lists them; `togi mcp call <bundle> <tool> [--args JSON]` makes one MCP tool call through
+the same code the server runs (surface `mcp` in the journal, no 8 KB CLI cap) without the stdio protocol, for harnesses.
 
 ---
 
@@ -674,7 +703,203 @@ It goes through the same host execution path (guards, journal).
   - journal shape (no values);
   - friction summary, tier classification, locked-hash enforcement, audit chain verify and tamper
     detection, apply decisions (all branches, with the script driver), the MCP bridge listing.
+  - **(eval)** `tests/test_eval_*.py`: the schema validator; `togi answer` on cli/code mode/MCP; the task record; every check type;
+    items, the stone import and the unseen access control; subject hashes (a golden value); the statistics against known
+    values (Wilson, exact McNemar, a seeded bootstrap); item statistics, verdicts, curves and long-horizon metrics on synthetic
+    runs; every failure-taxonomy rule; the lock refusal; canaries and the contamination scan; resumable caching and a
+    2 subjects x 40 items x 3 repeats matrix with a resume; multi-session scripted items with cold starts, between events and the
+    approval hook; every agent loop on single- and multi-session items against a mock OpenAI-compatible/Ollama server (tool calls,
+    constrained output, max steps, errors, prompt tokens per step); claude-step and claude-cli against a mocked `claude`; the sheet
+    generator (determinism, answers recomputed independently, against the real sheet bundle where present); the report and
+    compare. No test touches the network (the mock server is on 127.0.0.1) or downloads a model.
 - **Example bundle:** a tiny one in `examples/notes/` (no network) used by the tests.
 - **Speed:** `togi skill` and `togi tools` complete in < 150 ms on a laptop.
 - **README:** what it is, a 60-second quickstart, how to write a bundle, guardrails and their
   honest limits.
+
+---
+
+## 9. Eval: the outcome-driven benchmark layer (2026-10-27)
+
+Design record: docs/EVAL-SPEC.md. Code: `src/togi/evals/`. It answers one question with evidence: **what reaches a declared outcome
+at the lowest cost** (which model, which harness settings, whether fine-tuning or distillation is needed at all), for any
+outcome, not just the bundles we have. Nothing in `togi.evals` imports a specific bundle.
+
+### 9.1 Objects
+
+- **Outcome** (`outcomes/<name>.toml`, `togi eval outcome new <name>`): `name`, `description`, `decision` (what the result
+  decides), `primary_metric = "success_rate"` over `splits` (default `test`+`unseen`; `dev` never counts), `[gates]` applied to
+  EVERY slice (`min_success`, `min_success_lcb` = the Wilson 95% lower bound, `max_forbidden`, optional `max_median_turns`,
+  `max_median_cost_usd`, optional `[gates.non_inferior] to, margin`), `[slices]` (which capability tags / tiers / worlds to gate,
+  `min_cells`), `[[reference]]` (`subject`, `bar = target | fallback`). Its hash covers all of it.
+- **Item** (`items/<split>/<id>.toml`): identity (`id`, `world`, `split` dev|test|unseen, `tier` 1-5, `capabilities` tags: tool-choice,
+  single-step, multi-step, recovery, approval-stop, synthesis, ambiguity, refusal, injection-resistance, code-mode-benefit,
+  numeric, long-horizon), `bundles`, `setup` (harness commands; `$EVAL_SUITE_DIR` is the suite directory), one or more
+  **sessions** (below), an `answer_schema` (JSON Schema, an object), end-of-item `[[check]]`s, `[[forbid]] command_prefix`,
+  `budget_turns` (per session), optional `reference_trajectory` (replayable commands: the `script` provider replays it as an oracle),
+  `reference_answer`, `canary`, `data_files` (hashed into the item hash). **Item hash** = sha256 of the canonical item content +
+  the data files' bytes. A **stone task file is a valid item file**: `holdout = true` becomes split `test`, otherwise `dev`;
+  `cmd`/`expect_jsonpath` checks become `state_jsonpath`, `transcript_contains` stays (legacy, discouraged), `forbid` carries over.
+- **Sessions** (multi-session, long-running items): `[[session]]` blocks, each with its own `instruction` (default
+  "Continue the task."), optional `between = [...]` (commands the harness runs just before the session to change the world:
+  buyers join, a payment fails; `@approve|@deny|@expire <latest | ap_id | command words>` is the test-only approval hook,
+  run in the sandbox with its throwaway approver and never reachable from the `togi` command line), optional per-session
+  `[[session.check]]` (milestones for the per-session success curve; `gate = true` makes one count toward the item), and
+  per-session scripts for the `script` provider (`{approval}` in a script step is the newest approval id). **Each session starts
+  the agent COLD**: a new agent session id and a fresh conversation. Continuity comes from Togi state alone.
+- **Suite** (`suite.toml` + `items/` + `data/`): `name`, `canary`, `[bundles.<name>] path` (else the registry), `generator`.
+  `items.load_suite(path, purpose=...)`: a purpose reads only the splits it may (`PURPOSE_SPLITS`): `run` dev+test (+unseen only
+  with `include_unseen`), `hone`/`examples`/`skills` dev only, `apply` test only, `lock`/`contamination`/`report` all. Files of
+  a split a purpose may not read are not opened.
+- **Subject** = model x provider x harness config x surface (`cli`|`run`|`mcp`), with a stable **hash** over exactly what changes
+  its behaviour (provider, model, surface, the harness keys that provider uses, sampling options, the skill variant's file
+  CONTENTS). Labels, `size`, `price` and endpoints are not in it. Providers: `script` (deterministic replay), `claude-cli`
+  (Claude Code's own loop, the stone driver's isolation), `claude-step` (OUR loop, a Claude model as the per-step policy via
+  `claude -p --tools= --output-format json --model M`, one call per step, on the subscription), `ollama`, `openai-compatible`
+  (OUR loop, a local model as the policy). Harness config: `skills` none|index|full, `next_hints`, `compact_output`,
+  `constrained_decoding` (local providers), `reasoning_field`, `examples`, `skill_version` (+ `skill_files`), `loop`
+  (react|operator|plan-act-verify|code-first), `context_policy` (full|window:N|state-only|auto), `step_budget`, `tools`
+  (single|per-command). `role`: candidate|reference|target|fallback. Subjects come from a TOML file (`[[subject]]`, with an
+  optional `[subject.matrix]` of lists that expands to the cross product) or a shorthand
+  `provider:model[@surface][+key=value...]`.
+
+### 9.2 `togi answer`: the structured final answer
+
+`togi answer --json '<object>'` (also `--file`, `--stdin`, or one positional JSON value) records the answer, validated against the
+item's schema in `$TOGI_HOME/answer-schema.json` (the harness writes it; without one any JSON object is accepted). On every surface:
+CLI `togi answer`, code mode `togi_answer(obj)` (raises `togi.TogiError(answer_invalid)`), MCP tool `answer` (`--builtins`). Records go
+to `$TOGI_HOME/state/_host/answers.jsonl` (`seq, ts, session, surface, valid, errors, answer`); an invalid answer is recorded
+as `valid: false` and refused with the fields to fix (exit 1, `answer_invalid`). Checks read the LAST VALID answer, never free
+text, so "47,248" cannot be a false fail (the `number` check also reads "$47,248.00"). Answers are bounded (16 KB).
+
+### 9.3 The task record (long-running work)
+
+`togi task start --goal "..."`, `togi task show`, `togi task update --done "..." --next "..." --waiting "..." [--status
+active|blocked|done]`; also MCP `task_*` and code-mode `togi_task_*`. One record per `$TOGI_HOME` in `state/_host/task.json`,
+bounded (goal 500 characters; the last 20 `done` entries of 300, older ones counted in `done_dropped`; `next`/`waiting` 600; 8 KB in
+all; over a limit is refused with the limit named, never silently cut). Every change appends a snapshot to
+`task-history.jsonl` (the last 200 kept). Journaled (types only). The index skill teaches the convention: **start every session
+with `togi task show`**.
+
+### 9.4 Check library (`evals/checks.py`)
+
+On the recorded answer: `exact`, `number` (normalised; `abs_tol`/`rel_tol`), `regex`, `one_of`, `set_equal` (`ordered`). State:
+`state_jsonpath` (a command's output after the run; equals, not_equals, contains, matches, exists, gt/gte/lt/lte, len_equals,
+or an exit code). Trajectory: `trajectory` with `rule` = used, never_used, max_calls, min_calls, called_before,
+ended_at_needs_approval, approval_requested, no_forbidden_prefix, used_code_mode (read from the journal, not from what the agent
+said). `budget` (turns, tokens, cost). `judge` (rubric + a calibration set of labelled examples, both labels required; calibrated
+first, reported separately, **never gates**). Legacy `transcript_contains`/`transcript_not_contains`. An item with an
+`answer_schema` gets an implicit `answer_valid`. `validate_check` runs on every item before a suite may run (an unknown type, a
+`number` with a non-number, a path that is not a field of the schema, a judge without calibration: a faulty check lies). New
+types register with `@register`.
+
+### 9.5 Agent loops (`evals/loops.py`, `evals/policy.py`)
+
+One small interface per strategy: state in -> prompt (`build_prompt`), reply -> next action (`interpret`), action + output ->
+state (`after`). The harness (`run_loop_session`) owns the backend call, the execution through Togi in the sandbox, accounting
+and the stop rules. The model's reply is one JSON action: `togi {argv}`, `run {script}`, `answer {answer}`, `finish`,
+`give_up`, or (per-command tools / MCP) `<bundle>_<command> {args}`. With `constrained_decoding` the action vocabulary is a JSON
+Schema (`oneOf`) handed to the provider's structured output (Ollama `format`, OpenAI `response_format`); without it the
+vocabulary is native tool calls (`tools`).
+
+- **react**: the baseline; the transcript grows.
+- **operator**: stateless and re-entrant. Every step rebuilds a SHORT context: the task record, the instruction, the latest action
+  and output. The model writes its progress (`done`, `next`) with each command and the loop stores it with `togi task update`.
+  No growing transcript; the best fit for small models and long-running work.
+- **plan-act-verify**: a first step that can only be `plan`, stored in the task record (`next: "PLAN: 1) ..."`); each action carries
+  `verify` (ok|failed|revise) and an optional `revised_plan`; the loop also verifies on its own (a failed command is a failed
+  verification) and resumes a plan found in the record in a later session.
+- **code-first**: prefers ONE `togi run` script that ends with `togi_answer`; stubs in the prompt; falls back to single calls.
+
+`context_policy` (full | window:N | state-only; `auto` = the loop's default) limits the history shown; `step_budget` caps the model calls
+per session. Every step records the prompt tokens actually sent (the provider's count, else an estimate flagged
+`prompt_tokens_estimated`), the chosen action, wall time, cost and loop-level events (`plan_written`, `plan_revised`,
+`verification_failed`, `invalid_reply`, `answer_rejected`, `record_updated`, `early_stop`). Stop rules: answer accepted (also when a
+script or a plain `togi answer` records it), `finish`, `give_up`, three invalid replies in a row, the same action and output four
+times, the step budget, the item's cost cap, the wall clock. A provider that is unreachable or answers nonsense is a **driver
+error** (`ProviderError`), never a verdict on the subject.
+
+### 9.6 Runs, the store and resumability
+
+`togi eval run --outcome O --suite S --subjects X --repeats N` runs subjects x items x repeats (seed = base seed + repeat), parallel
+with per-provider concurrency limits (`--concurrency claude-cli=2,ollama=1`; defaults script 4, claude-cli 1, claude-step 2, ollama
+1, openai-compatible 4). Each cell runs in a throwaway sandbox (`evals/sandbox.py`: stone's, with several bundles, the harness
+toggles in the environment, `TOGI_AGENT=eval`, call recording on, a new agent session per session). The store is
+`$TOGI_HOME/eval/`: `runs/<id>/manifest.json`, `runs/<id>/cells.<split>.jsonl` (one file per split, appended the moment a cell
+finishes), `cells/<subject hash>.jsonl` (the result cache). **A cell is reused when item hash, subject hash, seed AND the bundle's
+digest all match** (the bundle digest is an addition to the specified key: editing the bundle's code or skills must invalidate its
+results; its tests and stone tasks are not part of it). Driver-error cells are never cached. `--resume RUN` continues an interrupted run
+(the plan must be the same); running the same command again hits the cache. `--max-cost` stops dispatching new cells once the run's
+spend reaches it (status `stopped: cost_cap`); `--max-item-cost` is passed to the drivers; `--item-timeout` is the wall clock per
+session (the process group is killed). A cell records: answer, checks (with `session` and milestone flags), per-session results
+(instruction, turns, steps, events, answers, trajectory, metrics, task record, between log), turns, tokens, prompt tokens, cost,
+wall time, forbidden attempts, drift, the task-record history.
+
+### 9.7 Analysis (`evals/analysis.py`, `stats.py`, `taxonomy.py`; pure functions over a run)
+
+- **Success** with a Wilson 95% interval per subject x slice (overall, `capability:`, `tier:`, `world:`) and per split.
+- **Paired comparisons** on the same items: exact McNemar on item-level wins (with repeats an item is a win for the subject with the
+  higher pass rate on it) and a seeded, item-clustered paired bootstrap of the success difference (percentile interval; the same
+  seed gives the same interval to the bit).
+- **Item statistics**: difficulty (pass rate across subjects), discrimination (correlation of the item's pass with the subjects'
+  skill on the OTHER items; needs 3+ subjects), saturation flags (`all_pass`, `all_fail`), `negative_discrimination`, and
+  **suspect** items: a `reference`/`target` subject that fails an item flags it before anyone blames the subject under test (verdicts
+  are reported both with and without the suspect items).
+- **Curves**: success vs model size per harness config (isotonic-smoothed); **harness lift**: for a point on another config's curve,
+  the size at which the baseline curve reaches the same success (log-interpolated) and the gain factor, or `above_range`; **Pareto**
+  frontiers for success vs cost and success vs latency.
+- **Outcome verdicts**: the gates on the WORST slice with Wilson lower bounds -> PASS/FAIL per subject with reasons; the
+  non-inferiority gate against a reference by paired bootstrap; the smallest subject that passes (by size, then cost). Driver-error
+  cells count as failures and are reported as invalid.
+- **Failure taxonomy** (rule-based, from the trajectory): `driver_error, forbidden, budget, format, loop, gave_up, no_stop, bad_args,
+  wrong_tool, misread_output` (an answer number that is a transposed or mistyped copy of a tool output number), `did_math` (an answer
+  number in no tool output), `other`; first rule that fires is the class, the rest are tags; `togi eval audit <run> --class C` draws a
+  seeded random sample for a human.
+- **Reference-trajectory metrics**: for items with a `reference_trajectory`, per subject over its passed cells: `efficiency` (reference
+  calls / the subject's bundle calls; 1.0 = as lean as the reference), `coverage` (the share of the reference's commands it also
+  used) and extra calls. A cheap model that passes with three times the calls is a cost.
+- **Long-horizon metrics** (multi-session items): end-state success; steps per session; wasted actions (the same command and
+  arguments repeated with no state change between); drift (a state-changing call whose command words appear nowhere in the task
+  record at that moment, a deliberately simple repeatable rule); sessions ended at an approval and forbidden attempts; the
+  per-session success curve with Wilson intervals and its slope (does performance decay with session count?); task-record updates.
+
+### 9.8 Integrity
+
+`togi eval lock <suite> [--outcome --subjects --repeats]` hashes every item (all splits), `suite.toml` and the `data/` tree into
+`LOCK.json` and records the **pre-registration** (outcome and gates, subjects, repeats, splits, the analysis plan). `togi eval run`
+refuses a locked suite whose hash changed (`suite_changed_since_lock`); a run reports any deviation from the registered plan in its
+manifest; `--relock` records a new lock and keeps the old in its history. The **unseen** split runs only with `--include-unseen`;
+every run records the splits it touched and how many files stayed unread; hone reads dev failures only. **Canaries**: every item
+carries one; `togi eval contamination --suite S [--data DIR ...]` scans the bundles' skills, examples and polish/reshape files,
+hone proposals and any data directory for canaries and for word 8-gram overlap with test/unseen items. **Reference sanity**: every run
+needs at least one reference/target subject (`--no-reference-check` to waive); see suspect items above.
+
+### 9.9 Generators
+
+`togi eval generate <generator> --seed N --out <suite>`: seeded, correct by construction (the answer is computed by the real
+tool's engine over seeded data, never by a model; the same seed writes the same bytes). `sheet` writes spreadsheet questions:
+worlds are the splits (dev `retail-d1`; test `retail-t1`, `retail-t2` with other vocabulary, sizes and decimal prices; unseen
+`clinic-u1`, a DIFFERENT schema and domain: `visits`/`patients`, other columns and nouns), 17 templates covering totals, filters,
+counts, averages, top-k, gaps, per-group winners, joins, synthesis, ambiguity (the right answer is to ask), an unanswerable question
+(refusal), a misnamed table (recovery), a poisoned dimension row (injection resistance) and a delete that needs a person (approval
+stop). Every well-posedness condition (no ties for "top", a non-zero gap) is verified on the data before an item is emitted.
+
+### 9.10 Reports
+
+`togi eval report <run>` writes `report.json` and a self-contained `report.html` (inline CSS and inline SVG: no scripts, fonts, links or
+CDN; everything printed is escaped): verdicts, CI bars, paired deltas, item statistics, scaling and Pareto curves, failure classes,
+long-horizon table and per-session curve, integrity. `togi eval compare <a> <b>` matches subjects by hash (else by id): rate
+deltas (flagged CLEAR when the intervals do not overlap), item flips, verdict changes, items only in one run.
+
+### 9.11 Integration, switches and honest limits
+
+`stone --engine eval`, `bench --engine eval`, `hone` (dev failures from the eval store), `apply --outcome` (§5, §6). Environment
+switches the harness uses (they work anywhere): `TOGI_NEXT_HINTS=0` (error envelopes lose `next`), `TOGI_COMPACT=0`
+(pretty-printed JSON), `TOGI_EVAL_RECORD=1` (call recording, honoured only inside a stone/eval sandbox), `TOGI_MCP_BUILTINS=1`.
+
+Honest limits. The drift metric and the taxonomy are rules, not understanding: they are repeatable and auditable (`togi eval
+audit`), and they will mislabel some cells. Heuristic classes that need tool outputs (`misread_output`, `did_math`) rely on the
+output previews the eval sandbox records. A judge check needs a judge backend (`--judge claude:<model>`); without one it reports
+`ok: null` and decides nothing. The `mcp` surface for a loop provider serves one bundle at a time. The sandbox is a throwaway home
+and a `togi` shim, not an OS sandbox: the agent is a same-user process that is *asked* to use only `togi` (forbidden attempts are
+detected from the journal and fail the cell; they are not prevented).

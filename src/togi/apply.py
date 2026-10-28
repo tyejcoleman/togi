@@ -508,7 +508,9 @@ def effective_policy(man: Manifest, driver: str | None, runs: int | None) -> tup
 
 def apply_proposal(pid: str, *, runs: int | None = None, driver: str | None = None, model: str | None = None,
                    surface: str = "cli", dry_run: bool = False, task_timeout: float = 600,
-                   interactive: bool = True) -> dict:
+                   interactive: bool = True, outcome: dict | None = None) -> dict:
+    """`outcome` = {"outcome": file, "suite": dir, "subjects": spec, "repeats": n} adds one gate: the candidate must hold the
+    outcome's gates on the suite's TEST split (togi.evals.integration.outcome_gate; the unseen split is never run here)."""
     audit.refuse_agents("apply")
     meta, diff, rationale = load_proposal(pid)
     if meta.get("status") in ("applied", "rejected", "reverted"):
@@ -566,7 +568,7 @@ def apply_proposal(pid: str, *, runs: int | None = None, driver: str | None = No
         raise TogiError("evaluation_refused", f"proposal {pid} may not be evaluated ({block})",
                         next="togi review", status="refused")
     # ---- evaluate current vs candidate (cached per diff+repo state+settings)
-    key = _eval_key(repo, sha, driver, model, runs, surface)
+    key = _eval_key(repo, sha, driver, model, runs, surface, json.dumps(outcome, sort_keys=True) if outcome else "")
     cache = proposal_dir(pid) / "evaluation.json"
     ev = None
     cached = read_evaluation(pid)      # only a record signed by this machine's key; anything else is ignored
@@ -586,12 +588,22 @@ def apply_proposal(pid: str, *, runs: int | None = None, driver: str | None = No
             d.mkdir(parents=True, exist_ok=True)
             (d / f"{after_res['id']}.json").write_text(json.dumps(after_res, indent=1), encoding="utf-8")
             after_res["path"] = str(d / f"{after_res['id']}.json")
+            gate = None
+            if outcome:
+                from .evals import integration
+
+                gate = integration.outcome_gate(repo, cand, outcome, bundle)
         ev = {"key": key, "before": compact(before_res["summary"], before_res["id"]),
               "after": compact(after_res["summary"], after_res["id"]),
               "driver": driver, "model": model, "runs": runs, "surface": surface, "at": now_ts()}
+        if outcome:
+            ev["outcome_gate"] = gate
         ev["mac"] = sign_evaluation(pid, ev)
         cache.write_text(json.dumps(ev, indent=1), encoding="utf-8")
     dec = decide(cl.tier, man.auto_polish, ev["before"], ev["after"], touches_skill=touches_skill, driver=driver)
+    og = ev.get("outcome_gate") if outcome else None
+    if og is not None and not og.get("ok") and dec.action != "reject":
+        dec = Decision("reject", "policy", "outcome_gate_failed: " + og.get("reason", ""), {**dec.gates, "outcome_gate": og})
     result: dict[str, Any] = {"proposal": pid, "bundle": bundle, "tier": cl.tier, "files": files,
                               "action": dec.action, "decided_by": dec.decided_by, "reason": dec.reason,
                               "stone_before": ev["before"], "stone_after": ev["after"], "gates": dec.gates,
@@ -655,9 +667,11 @@ def _needs_evaluation_approval(meta: dict, pid: str, bundle: str, cl: Classified
     return result
 
 
-def _eval_key(repo: Path, sha: str, driver: str, model: str | None, runs: int, surface: str) -> str:
+def _eval_key(repo: Path, sha: str, driver: str, model: str | None, runs: int, surface: str, extra: str = "") -> str:
     h = hashlib.sha256()
     h.update(f"v{EVAL_SCHEMA}|{sha}|{driver}|{model}|{runs}|{surface}".encode())
+    if extra:
+        h.update(b"|outcome|" + extra.encode())
     for rel in sorted(walk_files(repo)):
         if rel.startswith(".togi/"):
             continue
@@ -819,16 +833,23 @@ def h_review(argv: list[str]) -> Reply:
 
 def h_apply(argv: list[str]) -> Reply:
     pos, f = parse_flags(argv, {"runs": "int", "driver": "str", "model": "str", "surface": "str",
-                                "dry-run": "bool", "task-timeout": "float"}, "apply")
+                                "dry-run": "bool", "task-timeout": "float", "outcome": "str", "suite": "str",
+                                "subjects": "str", "repeats": "int"}, "apply")
     if f["help"]:
         return _usage("apply")
     if len(pos) != 1:
         raise TogiError("bad_arg", "togi apply needs a proposal id", next="togi review")
     if f["driver"] and f["driver"] not in ("claude", "script"):
         raise TogiError("bad_arg", "--driver must be claude or script", next="togi apply --help")
+    gate = None
+    if f["outcome"] or f["suite"] or f["subjects"]:
+        if not (f["outcome"] and f["suite"] and f["subjects"]):
+            raise TogiError("bad_arg", "--outcome, --suite and --subjects go together", next="togi apply --help")
+        gate = {"outcome": f["outcome"], "suite": f["suite"], "subjects": f["subjects"], "repeats": f["repeats"] or 1}
     res = apply_proposal(pos[0], runs=f["runs"], driver=f["driver"], model=f["model"],
                          surface=f["surface"] or "cli", dry_run=f["dry_run"],
-                         task_timeout=f["task_timeout"] or 600, interactive=sys.stdin.isatty() and sys.stdout.isatty())
+                         task_timeout=f["task_timeout"] or 600, interactive=sys.stdin.isatty() and sys.stdout.isatty(),
+                         outcome=gate)
     if res.get("needs_human"):
         return Reply(env=output.error_envelope(
             "needs_approval", "needs_human",

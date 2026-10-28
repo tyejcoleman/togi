@@ -91,6 +91,17 @@ def stone_friction(bundle: str) -> dict:
     return agg
 
 
+def eval_dev_failures(bundle: str, limit: int = 5) -> list[dict]:
+    """Failures on the eval layer's DEV split (the latest eval run). Hone reads dev only: the eval store keeps each split in
+    its own file and only the dev file is opened, so test and unseen results never reach a prompt."""
+    try:
+        from .evals import integration
+
+        return integration.dev_failures(bundle, limit)
+    except Exception:       # no eval runs yet, or an unreadable store: hone works without
+        return []
+
+
 def build_prompt(man: Manifest) -> str:
     entries = journal.read(man.name)
     fr = journal.friction(entries)
@@ -99,7 +110,17 @@ def build_prompt(man: Manifest) -> str:
     parts = [f"Tool: {man.name} - {man.summary}", "", "FRICTION (from real usage):", json.dumps(fr_small, indent=1),
              "", "STONE FAILURES (latest run, non-holdout):", json.dumps(stone_failures(man.name), indent=1), "",
              "STONE FRICTION (latest run, non-holdout: where agents stumbled even when they passed):",
-             json.dumps(stone_friction(man.name), indent=1), "",
+             json.dumps(stone_friction(man.name), indent=1), ""]
+    dev = eval_dev_failures(man.name)
+    if dev:
+        parts += ["EVAL FAILURES (latest eval run, dev split only):", json.dumps(dev, indent=1), ""]
+        try:
+            from .evals import integration
+
+            parts += ["EVAL FRICTION (dev split only):", json.dumps(integration.dev_friction(man.name), indent=1), ""]
+        except Exception:
+            pass
+    parts += [
              "FILES YOU MAY CHANGE (tier in brackets; polish = wording, reshape = behaviour):"]
     for rel, tier, text in editable_files(man):
         parts.append(f"\n=== {rel} [{tier}] ===\n{text}")

@@ -9,6 +9,7 @@ import datetime as _dt
 import enum
 import json
 import math
+import os
 import uuid
 from decimal import Decimal
 from pathlib import PurePath
@@ -40,7 +41,9 @@ def json_default(o: Any) -> Any:
 
 
 def dumps(obj: Any) -> str:
-    """Compact single-line JSON."""
+    """Compact single-line JSON. (`TOGI_COMPACT=0`, an eval-harness ablation, pretty-prints it instead.)"""
+    if os.environ.get("TOGI_COMPACT") == "0":
+        return json.dumps(obj, indent=2, ensure_ascii=False, default=json_default)
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, default=json_default)
 
 
@@ -72,7 +75,7 @@ def ok_envelope(data: Any) -> dict:
 
 def error_envelope(status: str, code: str, message: str, next: str | None = None, **extra: Any) -> dict:
     env: dict[str, Any] = {"ok": False, "status": status, "error": {"code": code, "message": message}}
-    if next:
+    if next and os.environ.get("TOGI_NEXT_HINTS") != "0":    # `TOGI_NEXT_HINTS=0`: an eval-harness ablation
         env["next"] = next
     env.update({k: v for k, v in extra.items() if v is not None})
     return env

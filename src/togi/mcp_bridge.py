@@ -19,13 +19,15 @@ import os
 import sys
 from typing import Any
 
-from . import host, output, registry, skills
+from . import answers, host, output, registry, skills, taskrec
 from .bundle import Command
 from .cli import Reply, parse_flags, _mode, _usage
 from .errors import ArgError, TogiError
 from .registry import Loaded
 
 SKILL_SUFFIX = "skill"
+BUILTIN_TOOLS = ("answer", "task_start", "task_show", "task_update")   # not bundle commands: no `<bundle>_` prefix
+BUILTINS_ENV = "TOGI_MCP_BUILTINS"       # =1: the server also lists the built-in tools (`togi mcp serve <bundle> --builtins`)
 
 
 def skill_tool_name(loaded: Loaded) -> str:
@@ -48,7 +50,53 @@ def skill_spec(loaded: Loaded) -> dict:
             "command": None, "effect": "read"}
 
 
-def tool_specs(loaded: Loaded) -> list[dict]:
+def builtin_specs() -> list[dict]:
+    """The host's own tools, the MCP twins of `togi answer` and `togi task ...`. `answer` takes the answer object itself
+    as its arguments; when the task has a schema (`$TOGI_HOME/answer-schema.json`) that schema is its input schema."""
+    sch = answers.load_schema()
+    ans_schema = {k: v for k, v in sch.items() if k != "$schema"} if sch else {"type": "object", "additionalProperties": True}
+    ans_schema.setdefault("type", "object")
+    return [
+        {"name": "answer", "description": "Record your final structured answer. The arguments ARE the answer object. If it is "
+                                          "refused, fix the fields it names and call again. [effect: write]",
+         "inputSchema": ans_schema, "command": None, "effect": "write"},
+        {"name": "task_show", "description": "Show the task record (goal, done, next, waiting). Call this FIRST in every "
+                                             "session. [effect: read]",
+         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "command": None, "effect": "read"},
+        {"name": "task_start", "description": "Begin a long-running job: set its goal. [effect: write]",
+         "inputSchema": {"type": "object", "properties": {"goal": {"type": "string"}, "force": {"type": "boolean"}},
+                         "required": ["goal"], "additionalProperties": False}, "command": None, "effect": "write"},
+        {"name": "task_update", "description": "Update the task record: what you finished, what comes next, what you are "
+                                               "waiting for. [effect: write]",
+         "inputSchema": {"type": "object", "properties": {
+             "done": {"type": "array", "items": {"type": "string"}}, "next": {"type": "string"},
+             "waiting": {"type": "string"}, "status": {"type": "string", "enum": list(taskrec.STATUSES)}},
+             "additionalProperties": False}, "command": None, "effect": "write"},
+    ]
+
+
+def call_builtin(name: str, arguments: dict[str, Any] | None, session: str | None = None) -> tuple[dict, bool]:
+    args = dict(arguments or {})
+    if name == "answer":
+        res = answers.record(args, surface="mcp", session=session)
+        return answers.envelope(res), not res["valid"]
+    sub = name[len("task_"):]
+    unknown = [k for k in args if k not in {"start": ("goal", "force"), "show": (),
+                                            "update": ("done", "next", "waiting", "status")}[sub]]
+    if unknown:
+        return output.error_envelope("error", "unknown_flag", f"{name} takes no argument {unknown[0]!r}",
+                                     next=f"call {name} with its documented arguments"), True
+    done = args.get("done")
+    try:
+        data = taskrec.run(sub, goal=args.get("goal"), done=[done] if isinstance(done, str) else done,
+                           next_=args.get("next"), waiting=args.get("waiting"), status=args.get("status"),
+                           force=bool(args.get("force")), surface="mcp")
+    except TogiError as e:
+        return output.error_envelope(e.status, e.code, e.message, next=e.next), True
+    return output.ok_envelope(data), False
+
+
+def tool_specs(loaded: Loaded, builtins: bool = False) -> list[dict]:
     specs = [skill_spec(loaded)]
     for cmd in loaded.bundle.commands.values():
         schema = cmd.json_schema()
@@ -62,6 +110,8 @@ def tool_specs(loaded: Loaded) -> list[dict]:
             schema["properties"]["dry_run"] = {"type": "boolean", "description": "describe without doing it"}
         specs.append({"name": tool_name(loaded.name, cmd), "description": desc, "inputSchema": schema,
                       "command": cmd.name, "effect": cmd.effect})
+    if builtins or os.environ.get(BUILTINS_ENV) == "1":
+        specs += builtin_specs()
     return specs
 
 
@@ -96,6 +146,9 @@ def call_tool(loaded: Loaded, name: str, arguments: dict[str, Any] | None, sessi
     if name == skill_tool_name(loaded):
         env, is_error = call_skill(loaded, arguments)
         return env, is_error
+    if name in BUILTIN_TOOLS:
+        env, is_error = call_builtin(name, arguments, session)
+        return _cut(env), is_error
     args = dict(arguments or {})
     approval = args.pop("approval", None)
     dry_run = bool(args.pop("dry_run", False))
@@ -138,7 +191,7 @@ def _fastmcp():
     return FastMCP
 
 
-def instructions_for(name: str) -> str:
+def instructions_for(name: str, builtins: bool = False) -> str:
     try:
         summary = registry.manifest_for(name).summary
         extra = ""
@@ -146,12 +199,14 @@ def instructions_for(name: str) -> str:
         summary, extra = "", f" (the bundle could not be read: {e.message})"
     return (f"{summary} Start by calling the `{name}_skill` tool: it explains the bundle. Every other tool is a "
             f"{name} command; money tools need a person's approval (you get an approval id back; never try to "
-            f"approve it yourself).{extra}").strip()
+            f"approve it yourself).{extra}" + (
+                " Long-running work: call `task_show` first in every session. A task that asks for a structured answer "
+                "ends with the `answer` tool." if builtins else "")).strip()
 
 
-def build_server(name_or_loaded):
+def build_server(name_or_loaded, builtins: bool = False):
     """A FastMCP server for a bundle. Given a name, the bundle is imported lazily (first list/call); given a
-    Loaded (tests) it is used as is."""
+    Loaded (tests) it is used as is. `builtins` also lists `answer` and `task_*` (see builtin_specs)."""
     FastMCP = _fastmcp()
     from mcp.types import TextContent
     from mcp.types import Tool as MCPTool
@@ -170,7 +225,7 @@ def build_server(name_or_loaded):
 
             def build() -> list[dict]:
                 try:
-                    return tool_specs(get_loaded())
+                    return tool_specs(get_loaded(), builtins)
                 except TogiError as e:
                     raise RuntimeError(f"{e.code}: {e.message}" + (f" (next: {e.next})" if e.next else ""))
 
@@ -193,7 +248,7 @@ def build_server(name_or_loaded):
                 raise RuntimeError(text)  # the SDK turns this into isError=true with exactly this text
             return [TextContent(type="text", text=text)]
 
-    return TogiMCP(f"togi-{name}", log_level="WARNING", instructions=instructions_for(name))
+    return TogiMCP(f"togi-{name}", log_level="WARNING", instructions=instructions_for(name, builtins))
 
 
 def serve_stdio(server) -> None:
@@ -215,23 +270,43 @@ def serve_stdio(server) -> None:
 
 
 def h_mcp(argv: list[str]) -> Reply:
-    pos, f = parse_flags(argv, {}, "mcp")
+    pos, f = parse_flags(argv, {"builtins": "bool", "args": "str"}, "mcp")
     if f["help"] or not pos:
         return _usage("mcp")
     sub = pos[0]
-    if sub not in ("serve", "tools"):
+    if sub not in ("serve", "tools", "call"):
         raise TogiError("bad_arg", f"unknown mcp subcommand '{sub}'", next="togi mcp serve <bundle>")
+    if sub == "call":
+        return _h_call(pos, f)
     if len(pos) != 2:
         raise TogiError("bad_arg", f"togi mcp {sub} needs a bundle name", next="togi bundles")
     if sub == "tools":
         loaded = registry.load(pos[1])
         return Reply(env=output.ok_envelope([{k: s[k] for k in ("name", "description", "inputSchema")}
-                                             for s in tool_specs(loaded)]), mode=_mode(f))
+                                             for s in tool_specs(loaded, f["builtins"])]), mode=_mode(f))
     if pos[1] not in registry.entries():
         raise TogiError("unknown_bundle", f"no bundle named '{pos[1]}' is registered", next="togi bundles")
-    server = build_server(pos[1])
+    server = build_server(pos[1], f["builtins"])
     serve_stdio(server)
     return Reply(silent=True, code=0)
+
+
+def _h_call(pos: list[str], f: dict) -> Reply:
+    """`togi mcp call <bundle> <tool> [--args JSON]`: one MCP tool call through the same code the server runs (surface
+    "mcp" in the journal, no 8 KB CLI cap), without the stdio protocol. For harnesses that drive the MCP surface."""
+    import json
+
+    if len(pos) != 3:
+        raise TogiError("bad_arg", "togi mcp call needs a bundle and a tool name", next="togi mcp tools <bundle>")
+    try:
+        arguments = json.loads(f["args"]) if f["args"] else {}
+    except ValueError:
+        raise TogiError("bad_arg", "--args must be a JSON object", next="togi mcp call <bundle> <tool> --args '{}'")
+    if not isinstance(arguments, dict):
+        raise TogiError("bad_arg", "--args must be a JSON object", next="togi mcp call <bundle> <tool> --args '{}'")
+    loaded = registry.load(pos[1])
+    env, _ = call_tool(loaded, pos[2], arguments)
+    return Reply(env=env, mode=_mode(f), code=output.exit_code_for(env), capped=True)
 
 
 # --------------------------------------------------------------------------- client side (stone / bench)

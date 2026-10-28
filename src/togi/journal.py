@@ -58,7 +58,9 @@ HOST_FLAGS = frozenset({
     "json", "text", "full", "fields", "limit", "offset", "help", "dry-run", "approval",      # every command
     "ttl", "all", "local", "verify", "chain-only", "topics", "friction", "since",            # approve, approvals, add, log, ...
     "runs", "driver", "model", "surface", "surfaces", "tasks", "no-tests", "task-timeout",   # stone, apply, bench
-    "max-cost", "diff", "rationale", "timeout", "max-output"})                               # hone, run
+    "max-cost", "diff", "rationale", "timeout", "max-output",                                # hone, run
+    "engine", "outcome", "suite", "subjects", "repeats",                                     # stone/bench --engine, apply --outcome
+    "goal", "done", "next", "waiting", "status", "force", "args", "builtins"})               # task, mcp call/serve
 
 
 def flag_name_shape(name: str, known: Iterable[str] | None = None) -> str:

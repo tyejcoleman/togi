@@ -26,6 +26,14 @@ from .registry import Loaded
 
 MAX_HINT_CHARS = 300
 PRINT_CAP = 4096          # what a command may print to stdout while it runs; the rest is dropped
+EVAL_RECORD_ENV = "TOGI_EVAL_RECORD"   # the eval harness sets it in its sandbox: journal entries then also hold the call
+ARGS_PREVIEW = 400                     # arguments and a preview of the output (for trajectory analysis). Honoured ONLY inside a
+OUT_PREVIEW = 600                      # stone/eval sandbox (approvals.sandbox_optin), so a real journal never holds values.
+
+
+def eval_recording() -> bool:
+    """True inside an eval/stone sandbox whose harness asked for full call records (see EVAL_RECORD_ENV)."""
+    return os.environ.get(EVAL_RECORD_ENV) == "1" and approvals.sandbox_optin()
 
 
 @dataclass
@@ -311,6 +319,12 @@ def call(loaded: Loaded, cmd: Command | None, args: dict[str, Any], opts: CallOp
         if opts.cap and not opts.full and output._size(env) > output.MAX_BYTES:
             env, truncated = output.hard_cap(env, output.MAX_BYTES), True   # the final guarantee, whatever got here
     out_bytes = len(output.dumps(env).encode("utf-8"))
+    if eval_recording():       # the harness's own sandbox only: values stay out of every real journal
+        try:
+            extra["args_full"] = output.dumps(output.to_jsonable(args))[:ARGS_PREVIEW]
+        except (TypeError, ValueError):
+            pass
+        extra["out_preview"] = output.dumps(env)[:OUT_PREVIEW]
     # ---- journal (types only, never values)
     entry = journal.make_entry(
         surface=opts.surface, bundle=bundle_name, command=cmd.name if cmd else None, event=event,

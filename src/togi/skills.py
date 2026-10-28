@@ -10,8 +10,7 @@ from .manifest import Manifest, ManifestError, load_manifest
 INDEX_HEAD = """\
 Togi: one CLI host for tool bundles. Learn a tool in one call, use it with compact JSON.
 Conventions
-- Learn a bundle: `togi skill <bundle>`. One topic: `togi skill <bundle> <topic>`; list them with `--topics`.
-- See commands as Python stubs: `togi tools <bundle>` (`--json` for JSON Schema).
+- Learn a bundle: `togi skill <bundle> [<topic>]` (`--topics` lists them). Commands as Python stubs: `togi tools <bundle>` (`--json`: schemas).
 - Run one: `togi <bundle> <words> --flag value`. Add `--help` for that command's flags.
 - Output is one-line JSON: {"ok":true,"data":...} or {"ok":false,"status","error":{"code","message"},"next"}.
 - Exit codes: 0 ok, 1 error, 2 refused, 3 needs approval, 4 internal bug. Every error has a `next`: run it.
@@ -21,6 +20,9 @@ Conventions
   re-run the same command with `--approval <id>`. Never try to approve yourself.
 - Many calls at once: `togi run script.py` (or `-` for stdin). Each bundle is a module: `crowd.drop_status(drop="d1")`.
   Only what the script prints comes back. A money call raises togi.NeedsApproval.
+- Long jobs: START EVERY SESSION WITH `togi task show` (a new session remembers nothing else); `togi task start --goal "..."`,
+  then `togi task update --done "..." --next "..." --waiting "..."`.
+- A task that wants a structured answer ends with `togi answer --json '{...}'` (code mode `togi_answer({...})`); fix what it refuses.
 Bundles"""
 
 

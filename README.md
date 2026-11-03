@@ -537,8 +537,10 @@ up from the cwd) is merged over the global registry; its entries win.
 
 **Threat model: read this first.** Togi's guarantees hold when the agent reaches your tools **only through Togi's own
 surfaces**:
-- a shell restricted to `togi …` commands (for Claude Code: `--allowedTools "Bash(togi:*)"`, as the stone and the demo
-  run it);
+- a shell restricted to `togi …` commands (for Claude Code: `--tools Bash --allowedTools "Bash(togi:*)"` **together with
+  `--restricted --permission-mode dontAsk`**: an allow-list only adds to the person's own settings, and a `Bash(*)` rule
+  or an `auto` default mode in `~/.claude/settings.json` lets every other command through. `--restricted` ignores the
+  user, project and local settings files; `dontAsk` denies whatever the allow-list does not name);
 - `togi run` scripts (sandboxed on macOS);
 - the MCP bridge.
 
@@ -554,6 +556,13 @@ No in-process check can stop the same user from changing the checker. If an agen
 **separate OS user or in a container** that can reach only the `togi` command and its bundle repos read-only. The v0.2
 plan removes this limit: a small Togi service runs as you, holds the approver and audit keys, and executes gated
 commands; the agent gets only a thin client over a socket.
+
+A **plain copy** of your approver (its files copied, not linked) used as a test approver is **not detected**. Togi tells your own
+approver from a test one by its place: `TOGI_APPROVER_HOME` naming the fixed directory by another path, or approver files that are
+the fixed approver's own (a link, a hard link). A copy of the files is only more files. The desk therefore opens for it without a
+terminal, as for any test approver; what it signs is test scope, and a bundle decides what that is worth (Crowd honours it only on
+its Pretend PayPal, where no money moves). A same-user process can make a test approver of its own anyway, so the copy adds no new
+power, but "the desk opened without a terminal" does not prove the approver is not yours.
 
 The sandbox below narrows what a `togi run` script is, but it is a same-user process under a profile, not a VM.
 
@@ -601,6 +610,34 @@ What is enforced in code:
   five wrong, and the approver is locked for ten minutes; every attempt, right or wrong, is a line in the `_host`
   journal. With no approver set up, those actions refuse and say to run `togi approver setup`. Waiting for a passphrase
   that never comes times out (2 minutes) instead of hanging the caller.
+- **The approval desk: a second way to approve, no weaker than the first.** A program a person starts (for example a
+  maker's web studio) can let them approve on its own page instead of with `togi approve`, through `togi.desk`. It is a
+  library, not a command: there is no CLI verb, flag or MCP tool for it, so nothing an agent runs through Togi reaches it.
+  - *Only a person's process opens one.* `Desk.open(host, commands)` runs once as the program starts and refuses
+    (`human_only`, `unsafe_interpreter`, `needs_tty`, `togi_home_unsafe`, `no_approver`) exactly where `togi approve` would:
+    `TOGI_AGENT` or `TOGI_RUN` set at all, a live `togi run` ancestor, an interpreter that is neither isolated nor clean
+    (start the program with `python3 -I`; the passphrase arrives in that process), an unsafe layout, no approver; and, for
+    your own (default-scope) approver, stdin and stdout not a terminal. A desk that did not open approves nothing. It names
+    the only `(bundle, command)` pairs it will take, and closes itself if the process is later marked as an agent's or the
+    approver changes.
+  - *You see what is signed, and the grant binds to it.* `review(id)` runs `verify_pending`, as `togi approve` does before
+    it prompts, fixes the expiry that will be signed, and returns the terminal's own prompt lines with a review id that
+    lives in the program's memory for 2 minutes (the terminal's passphrase timeout). `approve(id, review, passphrase)` refuses
+    unless that review is the desk's, unexpired and for this id, the request is still pending and unexpired, and
+    `verify_pending` gives the same signed fields again (`approval_changed`, `approval_tampered`, `approval_stale`,
+    `review_expired`, `approval_expired`); then the passphrase goes to the same approver check (same scrypt record, the same
+    five-wrong lock-out shared with the terminal, every attempt journaled with `surface: "desk"`), and `grant` signs exactly
+    the reviewed values, with the reviewed expiry, the same TTL and single use. `decided_by` (signed) names the desk.
+  - *The passphrase* is an argument handed to the approver check and nothing else: never stored, logged, journaled or
+    returned. The program must keep it off everything else (its request log, its errors, any agent's context); the review
+    id must reach only the person's own page.
+  - The typed confirmation word is not retyped on the desk. What binds the yes is the review: the page sends back the review
+    id, and nothing is granted unless every signed field Togi recomputes then (args, binding, summary, confirmation word, lock
+    line) is the one that review showed. The page shows the word (for a settle, the drop the request binds to) and sends back
+    the word it showed, which must match. A test-scope approver opens a desk without a terminal (anyone can make one and
+    knows its passphrase; the bundle decides what its yes is worth, as on the terminal path), but a `TOGI_APPROVER_HOME`
+    that is your own approver by another path (a symlink to `~/.togi/approver.d`, its files linked in) is treated as your own
+    and needs the terminal. A passphrase that cannot be encoded (a lone surrogate from a page) counts as a wrong one.
 - **The approver lives where an agent cannot move it (r2), in a directory of its own (r5).** The approver (`approver`,
   `approver.state`, the signing key `approver.key` and the spent-approval log) is kept in `<pw_dir>/.togi/approver.d` (mode
   0700), where `pw_dir` is your account's home directory from the password database, **not** `$HOME` and **not**

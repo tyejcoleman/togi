@@ -119,6 +119,35 @@ def require_safe_layout() -> None:
                         status="refused")
 
 
+def override_is_own_approver() -> bool:
+    """Is the `TOGI_APPROVER_HOME` override, in fact, the person's own approver? It is when it names the fixed directory (or
+    the r4 place the files moved from) by another path (a symlink, `..`, a trailing slash, another mount of it), or when its
+    approver files are the fixed approver's own files (linked in). Such an approver is test scope by name only: whatever the
+    person's own approver needs (for the desk, a terminal) applies to it. When the fixed place cannot be found, the answer
+    is yes (fail closed)."""
+    o = approver_override()
+    if o is None:
+        return False
+    try:
+        own = [fixed_approver_home(), legacy_approver_home()]
+    except TogiError:
+        return True
+
+    def same(a: Path, b: Path) -> bool:
+        try:
+            return os.path.samefile(a, b)
+        except OSError:
+            return os.path.realpath(a) == os.path.realpath(b)
+
+    for d in own:
+        if same(o, d):
+            return True
+        for name in ("approver", "approver.key", "approver.state"):
+            if (o / name).exists() and (d / name).exists() and same(o / name, d / name):
+                return True
+    return False
+
+
 def approver_scope() -> str:
     """`"test"` when the approver is the `TOGI_APPROVER_HOME` override, else `"default"`. Every grant carries the
     scope of the approver that signed it, and a grant is only honoured by a process whose scope matches."""

@@ -11,8 +11,9 @@ The desk keeps every one of those, moved to where a page needs them:
 
   Desk.open()   once, as the host program starts, on the program's own process: refused under TOGI_AGENT or TOGI_RUN
                 (set at all, even empty), under a live `togi run` ancestor, in an interpreter that is neither isolated nor
-                visibly clean, with an unsafe layout, or with no approver; and, for the person's own (default-scope)
-                approver, unless stdin and stdout are a terminal (the person started it from theirs). A desk that did not
+                visibly clean, with an unsafe layout, or with no approver; and, for the person's own approver (default
+                scope, or a TOGI_APPROVER_HOME that is that same approver by another path), unless stdin and stdout are a
+                terminal (the person started it from theirs). A desk that did not
                 open approves nothing, so the host offers no way to approve on its pages. `commands` names the only
                 (bundle, command) pairs it takes.
   review()      each time the page shows a request: `verify_pending`, exactly as `togi approve` runs it before it prompts,
@@ -25,8 +26,10 @@ The desk keeps every one of those, moved to where a page needs them:
                 `grant` signs exactly what was reviewed, with the reviewed expiry, and `decided_by` (signed) names the desk.
 
 The confirmation word: the terminal makes a person type it so the request they approve is the one they read. On the desk
-the yes is bound to the review the person was shown (the page sends the review id, and approve() refuses any change since),
-and the page sends the word it was shown, which must be the recomputed one; it is not retyped.
+it is not retyped. What binds the yes is the review: the page sends back the review id, and approve() refuses unless every
+signed field Togi recomputes then (args, their hash, the binding, the summary, the confirmation word, the lock line) is the
+one that review showed. The page must SHOW the word (for a settle it is the drop the request binds to) and send back the
+word it showed, which must be the recomputed one; a page that sent a word it never showed would bind nothing more.
 
 The passphrase: an argument to approve(), handed to `approver.require` and nothing else: never stored, logged, journaled
 or returned. The host must keep it off everything else too (its request log, its error messages, any agent's context).
@@ -75,10 +78,12 @@ def _person_started(host: str) -> None:
     if paths.in_run():
         raise TogiError("human_only", "the approval desk does not open inside `togi run` (TOGI_RUN is set)",
                         next=NEXT_PERSON, status="refused")
-    if paths.approver_scope() == "default" and not (approvals._isatty(sys.stdin) and approvals._isatty(sys.stdout)):
+    alias = paths.approver_scope() == "test" and paths.override_is_own_approver()
+    if (paths.approver_scope() == "default" or alias) and not (approvals._isatty(sys.stdin) and approvals._isatty(sys.stdout)):
         raise TogiError("needs_tty", "the approval desk opens for your own approver only in a program started from an "
-                                     "interactive terminal (stdin and stdout must be TTYs)", next=NEXT_PERSON,
-                        status="refused")
+                                     "interactive terminal (stdin and stdout must be TTYs)" +
+                        (": TOGI_APPROVER_HOME names your own approver, so it is not a test one" if alias else ""),
+                        next=NEXT_PERSON, status="refused")
     if runreg.started_by_togi_run():
         raise TogiError("human_only", "the approval desk does not open under `togi run` (a parent process is `togi run`)",
                         next=NEXT_PERSON, status="refused")

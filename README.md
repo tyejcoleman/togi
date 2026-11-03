@@ -624,9 +624,13 @@ What is enforced in code:
   - *The passphrase* is an argument handed to the approver check and nothing else: never stored, logged, journaled or
     returned. The program must keep it off everything else (its request log, its errors, any agent's context); the review
     id must reach only the person's own page.
-  - The typed confirmation word is not retyped on the desk: the yes is bound to the review the person was shown instead,
-    and the page sends the word it showed, which must match. A test-scope approver opens a desk without a terminal (anyone
-    can make one and knows its passphrase; the bundle decides what its yes is worth, as on the terminal path).
+  - The typed confirmation word is not retyped on the desk. What binds the yes is the review: the page sends back the review
+    id, and nothing is granted unless every signed field Togi recomputes then (args, binding, summary, confirmation word, lock
+    line) is the one that review showed. The page shows the word (for a settle, the drop the request binds to) and sends back
+    the word it showed, which must match. A test-scope approver opens a desk without a terminal (anyone can make one and
+    knows its passphrase; the bundle decides what its yes is worth, as on the terminal path), but a `TOGI_APPROVER_HOME`
+    that is your own approver by another path (a symlink to `~/.togi/approver.d`, its files linked in) is treated as your own
+    and needs the terminal. A passphrase that cannot be encoded (a lone surrogate from a page) counts as a wrong one.
 - **The approver lives where an agent cannot move it (r2), in a directory of its own (r5).** The approver (`approver`,
   `approver.state`, the signing key `approver.key` and the spent-approval log) is kept in `<pw_dir>/.togi/approver.d` (mode
   0700), where `pw_dir` is your account's home directory from the password database, **not** `$HOME` and **not**

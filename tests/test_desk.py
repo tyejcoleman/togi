@@ -114,6 +114,46 @@ def test_the_persons_own_approver_needs_a_terminal_to_open_a_desk(tipped, clean,
     assert d.status()["scope"] == "default"
 
 
+@pytest.mark.parametrize("how", ["symlink", "dotdot", "slash", "linked_files", "legacy"])
+def test_a_test_approver_that_is_the_persons_own_needs_a_terminal_too(tipped, clean, monkeypatch, tmp_path, how):
+    """Review (desk refuter, P2): TOGI_APPROVER_HOME naming <pw_dir>/.togi/approver.d by another path is scope "test" by name,
+    yet it is the person's own approver; it opened a desk with no terminal. Now it needs one, as the person's own does."""
+    fake = default_approver()                                           # the person's own approver, in the test's fake pw dir
+    own = paths.fixed_approver_home()
+    assert str(own).startswith(str(fake)) and (own / "approver").is_file()
+    if how == "symlink":
+        alias = tmp_path / "looks-like-a-test-approver"
+        alias.symlink_to(own, target_is_directory=True)
+    elif how == "dotdot":
+        alias = own / ".." / "approver.d"
+    elif how == "slash":
+        alias = Path(str(own) + "/")
+    elif how == "linked_files":
+        alias = tmp_path / "linked"
+        alias.mkdir()
+        for n in ("approver", "approver.key"):
+            if (own / n).exists():
+                (alias / n).symlink_to(own / n)
+    else:
+        alias = own.parent                                               # where r4 kept the files
+    monkeypatch.setenv("TOGI_APPROVER_HOME", str(alias))
+    assert paths.approver_scope() == "test" and paths.override_is_own_approver() is True
+    with pytest.raises(approvals.TogiError) as e:                       # pytest's stdin and stdout are not terminals
+        desk.Desk.open("studio", ONLY_TIPS)
+    assert e.value.code == "needs_tty" and "names your own approver" in e.value.message
+    monkeypatch.setattr(approvals, "_isatty", lambda f: True)           # from a terminal, as for the person's own
+    if how == "legacy":                                                  # (r5 keeps no approver there: nothing to open with)
+        with pytest.raises(approvals.TogiError) as e:
+            desk.Desk.open("studio", ONLY_TIPS)
+        assert e.value.code == "no_approver"
+    else:
+        assert desk.Desk.open("studio", ONLY_TIPS).status()["open"] is True
+
+
+def test_a_real_throwaway_approver_is_not_the_persons_own(opened):
+    assert paths.approver_scope() == "test" and paths.override_is_own_approver() is False
+
+
 def test_a_test_scope_desk_opens_without_a_terminal(opened):
     st = opened.status()
     assert st == {"open": True, "host": "notes test", "scope": "test", "commands": ["notes tip send"],
@@ -234,6 +274,30 @@ def test_an_empty_or_huge_passphrase_is_refused_before_any_check(opened):
             opened.approve(aid, rv["review"], bad)
         assert e.value.code == "passphrase_missing"
     assert approver.status()["wrong_attempts"] == 0
+
+
+def test_an_unencodable_passphrase_is_a_wrong_one_counted_and_journaled(opened, home):
+    """Review (desk refuter, P2): a lone surrogate (a page can send one in JSON) made scrypt's encode raise: a 500, no journal
+    line, no attempt counted. Now it is a wrong passphrase like any other."""
+    aid = request_approval()
+    rv = opened.review(aid)
+    before = len([x for x in journal.read("_host") if x.get("event") == "passphrase_attempt"])
+    for bad in ("\ud800", "pass\udfffword", "\udc80" * 20):
+        with pytest.raises(approvals.TogiError) as e:
+            opened.approve(aid, rv["review"], bad)
+        assert e.value.code in ("wrong_passphrase", "approver_locked")
+    assert approver.status()["wrong_attempts"] == 3 and approvals.load(aid)["status"] == "pending"
+    tries = [x for x in journal.read("_host") if x.get("event") == "passphrase_attempt"][before:]
+    assert [(t["surface"], t["ok"], t["error_code"]) for t in tries] == [("desk", False, "wrong_passphrase")] * 3
+    assert opened.approve(aid, rv["review"], PASSPHRASE)["status"] == "approved"
+
+
+def test_the_terminal_reader_too_counts_an_unencodable_passphrase(home):
+    from conftest import default_approver as _d  # noqa: F401 - (the test approver of `home` is the one checked)
+    approver.create(PASSPHRASE, n=2 ** 10, replace=True) if approver.load() is None else None
+    with pytest.raises(approvals.TogiError) as e:
+        approver.require("approve", reader=lambda _p: "\udfff")
+    assert e.value.code == "wrong_passphrase" and approver.status()["wrong_attempts"] == 1
 
 
 def test_a_request_changed_after_review_is_refused(opened):

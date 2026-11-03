@@ -494,7 +494,10 @@ def require(action: str, reader: Callable[[str], str] | None = None, *, need_key
         if st.locked_until > now:
             _journal(action, False, "approver_locked", surface)
             raise _locked_error(st.locked_until - now)
-        good = check(rec, pw)
+        try:
+            good = check(rec, pw)
+        except UnicodeError:       # a passphrase that cannot be encoded (a lone surrogate, sent from a page) is a wrong one:
+            good = False           # counted, journaled and locked out like any other, never an error that skips the counter
         if good:
             st.failures = 0
             st.save()

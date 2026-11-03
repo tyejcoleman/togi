@@ -557,6 +557,13 @@ No in-process check can stop the same user from changing the checker. If an agen
 plan removes this limit: a small Togi service runs as you, holds the approver and audit keys, and executes gated
 commands; the agent gets only a thin client over a socket.
 
+A **plain copy** of your approver (its files copied, not linked) used as a test approver is **not detected**. Togi tells your own
+approver from a test one by its place: `TOGI_APPROVER_HOME` naming the fixed directory by another path, or approver files that are
+the fixed approver's own (a link, a hard link). A copy of the files is only more files. The desk therefore opens for it without a
+terminal, as for any test approver; what it signs is test scope, and a bundle decides what that is worth (Crowd honours it only on
+its Pretend PayPal, where no money moves). A same-user process can make a test approver of its own anyway, so the copy adds no new
+power, but "the desk opened without a terminal" does not prove the approver is not yours.
+
 The sandbox below narrows what a `togi run` script is, but it is a same-user process under a profile, not a VM.
 
 What is enforced in code:

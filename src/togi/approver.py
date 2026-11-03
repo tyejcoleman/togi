@@ -385,12 +385,13 @@ def status() -> dict:
             "next": None if rec else "a person runs: togi approver setup"}
 
 
-def _journal(action: str, ok: bool, code: str | None) -> None:
-    """Every passphrase attempt is a journal line (host-level `_host` journal)."""
+def _journal(action: str, ok: bool, code: str | None, surface: str = "cli") -> None:
+    """Every passphrase attempt is a journal line (host-level `_host` journal). `surface` says where the passphrase was
+    typed: "cli" (the terminal, read from /dev/tty) or "desk" (a page served by a program the person started; desk.py)."""
     from . import journal
 
     journal.append(None, journal.make_entry(
-        surface="cli", bundle=None, command="approver verify", event="passphrase_attempt", ok=ok,
+        surface=surface, bundle=None, command="approver verify", event="passphrase_attempt", ok=ok,
         status="ok" if ok else "refused", error_code=code, effect="admin", for_action=action))
 
 
@@ -471,25 +472,27 @@ def _locked_error(remaining: float) -> TogiError:
                                         f"minute(s)", next=f"try again in {mins} minute(s)", status="refused")
 
 
-def require(action: str, reader: Callable[[str], str] | None = None, *, need_key: bool = True) -> None:
+def require(action: str, reader: Callable[[str], str] | None = None, *, need_key: bool = True, surface: str = "cli") -> None:
     """Ask for the passphrase and check it. Raises TogiError (refused) unless it is right. `need_key=False` is for
-    `setup`, which is how a missing key gets created."""
+    `setup`, which is how a missing key gets created. `reader` replaces the terminal read (/dev/tty): the approval desk
+    passes the passphrase a person typed into its page (`surface="desk"`); the record, the attempt counter, the lock-out
+    and the journal are the same ones, so a wrong guess on either surface counts against both."""
     rec = require_configured() if need_key else load()
     if rec is None:
         rec = require_configured()
     remaining = lock_remaining()
     if remaining > 0:
-        _journal(action, False, "approver_locked")
+        _journal(action, False, "approver_locked", surface)
         raise _locked_error(remaining)
     try:
         pw = (reader or read_secret)(PROMPT)
     except TogiError as e:
-        _journal(action, False, e.code)
+        _journal(action, False, e.code, surface)
         raise
     with _State() as st:           # verification happens under the lock: parallel guesses cannot race the counter
         now = time.time()
         if st.locked_until > now:
-            _journal(action, False, "approver_locked")
+            _journal(action, False, "approver_locked", surface)
             raise _locked_error(st.locked_until - now)
         good = check(rec, pw)
         if good:
@@ -501,7 +504,7 @@ def require(action: str, reader: Callable[[str], str] | None = None, *, need_key
             if st.failures >= FAIL_LIMIT:
                 st.locked_until, st.failures, left = now + LOCK_SECONDS, 0, 0
             st.save()
-    _journal(action, good, None if good else "wrong_passphrase")
+    _journal(action, good, None if good else "wrong_passphrase", surface)
     if good:
         return
     if left <= 0:

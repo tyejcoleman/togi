@@ -1,6 +1,6 @@
 # Togi fix round 1 (from the Opus refuter, 2026-10-27)
 
-Reproductions: /private/tmp/claude-501/-Users-taikicoleman--claude-spares-spare-3Et1Yw/bab3acdc-abaa-469c-b9d0-c4087670b940/scratchpad/refute-togi/
+Reproductions: the review's probe scripts, which are not kept in this repository.
 
 Each fix needs a regression test that fails before the fix and passes after.
 

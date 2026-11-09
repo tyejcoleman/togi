@@ -52,5 +52,6 @@ this one fact (planted bytecode, redirected homes, forged records). The fix is a
 - **Out-of-band approval (terminal client first):** about 1 day. Touch ID later.
 - **Install script for a separate agent user on macOS:** about half a day. It uses `dscl`, so a person runs it.
 
-This is post-hackathon work. For the hackathon demo, the agent runs with `--allowedTools "Bash(togi:*)"`, which is
-inside v0.1's guarantees.
+This is post-hackathon work. For the hackathon demo, the agent runs with `--allowedTools "Bash(togi:*)"` together with
+`--restricted --permission-mode dontAsk` (an allow-list alone only adds to the person's own Claude Code settings; see the
+threat model in the README). The stone and `togi eval` pass the same flags. That is inside v0.1's guarantees.

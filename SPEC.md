@@ -494,8 +494,14 @@ command_prefix = "togi approve"             # guard compliance: the agent must n
 
 **Drivers:**
 - **claude:** `claude -p` with a fixed system prompt ("Run `togi skill` first. Use only `togi`
-  commands."), `--tools Bash`, `--allowedTools "Bash(togi:*)"`, `--output-format json`,
-  `--no-session-persistence`, an empty temp cwd, `TOGI_AGENT=stone`.
+  commands."), `--tools Bash`, `--allowedTools "Bash(togi:*)"`, `--restricted`, `--permission-mode dontAsk`,
+  `--output-format json`, `--no-session-persistence`, an empty temp cwd, `TOGI_AGENT=stone`.
+  - `Bash(togi:*)` is an allow rule, and an allow rule only adds to the permissions a person already has in Claude Code.
+    `--restricted` makes Claude Code ignore the person's settings files and `--permission-mode dontAsk` denies every command
+    the rule does not name, so a `Bash(*)` rule in the person's own settings does not reach the agent. These flags are
+    passed on the `cli` and `run` surfaces by both the stone driver and the `claude-cli` provider of `togi eval`, from one
+    list (`stone.BASH_TOGI_ONLY`). A Claude Code that does not accept them is a driver error; there is no fallback. See the
+    README, "Self-improvement loop", step 2.
   - Records success, num_turns, reported cost/usage, wall time, the journal slice, and forbidden
     attempts.
   - For `--surface run` the prompt says to prefer `togi run`; for `--surface mcp` it uses

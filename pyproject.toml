@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,11 +7,13 @@ name = "togi"
 version = "0.1.0"
 description = "Togi: an agent-native CLI host. Learn a tool in one call, use it with token-cheap output, improve it under audit."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-mcp = ["mcp"]
+mcp = ["mcp<2"]
 dev = ["pytest"]
 
 [project.scripts]

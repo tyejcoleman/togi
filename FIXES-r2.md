@@ -61,9 +61,9 @@ stone, which executes the candidate code before any human has looked at it.
    proposal touching a `.py` file is refused.
 
 ## Constraints
-- Keep `python3 -m pytest -q` green; it is 365 now. Do not touch `~/Development/closure` (another check is
-  running there): the Crowd-side change (refusing test-scope approvals outside fake mode) will be made
-  separately.
+- Keep `python3 -m pytest -q` green; it was 365 tests at this point. This round changes Togi only: the
+  Crowd-side change (refusing test-scope approvals outside fake mode) is made separately, in the Crowd
+  Price repository.
 - Never create an approver in the real `<pw_dir>/.togi`. Use `TOGI_APPROVER_HOME` everywhere in tests,
   and assert no test writes to the real one.
 - No `claude -p`. No broad `pkill`. Do not commit.

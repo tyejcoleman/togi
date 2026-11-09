@@ -344,13 +344,39 @@ def mcp_config(sb: "Sandbox") -> dict:
     return {"mcpServers": {MCP_SERVER_KEY: {"command": argv[0], "args": argv[1:], "env": env}}}
 
 
+# The agent that has a shell (surfaces `cli` and `run`): the Bash tool and one allow rule, with Claude Code confined to it.
+# An allow rule only ADDS to the person's own Claude Code settings, so a `Bash(*)` rule or an `auto` default mode in
+# ~/.claude/settings.json would let every other command through. `--restricted` makes Claude Code ignore the user, project and
+# local settings files, and `--permission-mode dontAsk` denies whatever the allow rule does not name. The stone driver and the
+# claude-cli provider of `togi eval` both use THIS list, so they cannot differ, and nothing switches it off: TOGI_CLAUDE_ARGS
+# is placed before it on the command line. A Claude Code that does not accept it is an error (rejected_confinement), not a fallback.
+BASH_TOGI_ONLY = ("--restricted", "--permission-mode", "dontAsk", "--tools=Bash", "--allowedTools=Bash(togi:*)")
+
+CONFINEMENT_REJECTED = (
+    "the installed Claude Code does not accept `--restricted` or `--permission-mode dontAsk`, and Togi will not run the agent "
+    "without them: otherwise your own Claude Code permission rules would apply too, and the agent could run commands other than "
+    "`togi`. Update Claude Code. (`--driver script` and `--surface mcp` do not use them.)")
+
+
+def rejected_confinement(p: "subprocess.CompletedProcess") -> str | None:
+    """A plain message when `claude -p` stopped at its command line because it does not know `--restricted` or
+    `--permission-mode dontAsk`; else None. The caller reports it as a driver error and runs nothing else: there is no retry
+    without the flags."""
+    if p.returncode == 0:
+        return None
+    text = f"{p.stderr or ''}\n{p.stdout or ''}"
+    if re.search(r"unknown option|unrecognized|invalid|not allowed", text, re.I) and re.search(r"--restricted|--permission-mode|dontAsk", text):
+        return CONFINEMENT_REJECTED
+    return None
+
+
 def claude_command(model: str | None, surface: str, sb: "Sandbox", max_cost: float | None) -> list[str]:
     cmd = claude_base(safe_mode=surface != "mcp") + ["--system-prompt", system_prompt(surface, sb.bundle)]
     if surface == "mcp":
         cmd += ["--tools=", f"--allowedTools=mcp__{MCP_SERVER_KEY},mcp__{MCP_SERVER_KEY}__*", *MCP_ISOLATION,
                 "--mcp-config", json.dumps(mcp_config(sb))]
     else:
-        cmd += ["--tools=Bash", "--allowedTools=Bash(togi:*)"]
+        cmd += BASH_TOGI_ONLY
     if model:
         cmd += ["--model", model]
     if max_cost:
@@ -413,7 +439,8 @@ def run_task_claude(sb: Sandbox, task: Task, surface: str, model: str | None, ti
     try:
         res = parse_claude_output(p.stdout)
     except (ValueError, StopIteration):
-        return {"driver_error": f"claude -p exit {p.returncode}: {(p.stderr or p.stdout).strip()[:300]}"}
+        why = rejected_confinement(p) if surface != "mcp" else None
+        return {"driver_error": why or f"claude -p exit {p.returncode}: {(p.stderr or p.stdout).strip()[:300]}"}
     if res["is_error"]:
         res["driver_error"] = f"claude reported an error ({res.get('subtype')}): {res['answer'][:200]}"
     return res

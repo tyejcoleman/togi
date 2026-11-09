@@ -73,4 +73,4 @@ def test_the_launcher_closes_the_names_before_any_other_import():
 def test_the_readme_threat_model_says_what_a_plain_copy_of_your_approver_is():
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
     model = " ".join(readme[readme.index("**Threat model: read this first.**"):readme.index("The sandbox below narrows")].replace("*", "").split())
-    assert "plain copy" in model and "is not detected" in model and "test scope" in model and "Pretend PayPal" in model
+    assert "plain copy" in model and "is not detected" in model and "test scope" in model and "test mode" in model

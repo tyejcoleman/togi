@@ -52,7 +52,7 @@ regression test that fails at 12b4416 (`git stash` or a worktree) and passes aft
 - **L3.** Clamp `togi run --max-output` to the `--full` limit, and document it.
 
 ## Constraints
-- Do not touch `~/Development/closure`. A Crowd refuter is running there; its manifest will be updated
-  separately so its whole package is locked or reshape.
+- This round changes Togi only. The Crowd Price manifest is updated separately, in its own repository, so
+  that its whole package is locked or reshape.
 - Never write the real `<pw_dir>/.togi`.
 - No `claude -p`, no broad `pkill`, do not commit.

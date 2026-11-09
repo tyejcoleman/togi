@@ -2,7 +2,7 @@
 and nothing from earlier sessions except what Togi itself holds (journal, task record, bundle state).
 
     script           deterministic replay of the item's scripts (CI, oracle references)
-    claude-cli       Claude Code's own loop: `claude -p` with Bash(togi:*) or the MCP server (the stone driver's isolation)
+    claude-cli       Claude Code's own loop: `claude -p` with Bash(togi:*) (restricted, see stone.BASH_TOGI_ONLY) or the MCP server
     claude-step      OUR loop (loops.py), a Claude model as the per-step policy
     ollama / openai-compatible   OUR loop, a local model as the per-step policy
 
@@ -165,21 +165,28 @@ def tools_json(sb: EvalSandbox) -> list[dict]:
         return []
 
 
-def run_claude_cli(ctx: SessionContext) -> SessionRun:
-    sb, subject, item = ctx.sb, ctx.subject, ctx.item
-    surface = subject.surface
-    commands = tools_json(sb) if subject.harness.get("examples") else []
-    system = claude_system_prompt(ctx, commands)
+def claude_cli_command(system: str, surface: str, sb: EvalSandbox, model: str | None, max_cost: float | None) -> list[str]:
+    """The exact `claude -p` call of the claude-cli provider. Nothing is started here. The Bash surfaces use the same
+    confinement flags as the stone driver (`stone.BASH_TOGI_ONLY`)."""
     cmd = stone.claude_base(safe_mode=surface != "mcp") + ["--system-prompt", system]
     if surface == "mcp":
         cmd += ["--tools=", f"--allowedTools=mcp__{stone.MCP_SERVER_KEY},mcp__{stone.MCP_SERVER_KEY}__*", *stone.MCP_ISOLATION,
                 "--mcp-config", json.dumps(sb.mcp_config())]
     else:
-        cmd += ["--tools=Bash", "--allowedTools=Bash(togi:*)"]
-    if subject.model:
-        cmd += ["--model", subject.model]
-    if ctx.max_cost:
-        cmd += ["--max-budget-usd", f"{ctx.max_cost:g}"]
+        cmd += stone.BASH_TOGI_ONLY
+    if model:
+        cmd += ["--model", model]
+    if max_cost:
+        cmd += ["--max-budget-usd", f"{max_cost:g}"]
+    return cmd
+
+
+def run_claude_cli(ctx: SessionContext) -> SessionRun:
+    sb, subject, item = ctx.sb, ctx.subject, ctx.item
+    surface = subject.surface
+    commands = tools_json(sb) if subject.harness.get("examples") else []
+    system = claude_system_prompt(ctx, commands)
+    cmd = claude_cli_command(system, surface, sb, subject.model, ctx.max_cost)
     env = stone.claude_env(sb, surface)
     try:
         p = stone.run_group(cmd, input=ctx.session.instruction, env=env, cwd=sb.cwd, timeout=ctx.timeout)
@@ -190,7 +197,8 @@ def run_claude_cli(ctx: SessionContext) -> SessionRun:
     try:
         res = stone.parse_claude_output(p.stdout)
     except (ValueError, StopIteration):
-        return SessionRun(driver_error=f"claude -p exit {p.returncode}: {(p.stderr or p.stdout).strip()[:300]}")
+        why = stone.rejected_confinement(p) if surface != "mcp" else None
+        return SessionRun(driver_error=why or f"claude -p exit {p.returncode}: {(p.stderr or p.stdout).strip()[:300]}")
     if res["is_error"]:
         return SessionRun(driver_error=f"claude reported an error ({res.get('subtype')}): {res['answer'][:200]}", turns=res.get("turns"))
     return SessionRun(turns=res.get("turns"), answer_text=res["answer"], cost_usd=res.get("cost_usd"), tokens=res.get("tokens"),

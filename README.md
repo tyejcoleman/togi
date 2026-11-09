@@ -14,34 +14,43 @@ without setup, and improve under audit**.
   which harness settings reach a declared outcome at the lowest cost, including over many sessions where Togi holds the state.
 
 Python 3.11+, standard library only. (`mcp` is an optional extra for `togi mcp serve`.) Spec: [SPEC.md](SPEC.md).
+The OS sandbox for `togi run` uses macOS `sandbox-exec`; where it is missing (Linux) scripts run unsandboxed and say so
+(see "Guardrails and their honest limits").
 
-## 60-second quickstart
+## Quickstart
 
 ```sh
-# 1. Put `togi` on your PATH (or: pip install -e .)
-ln -s "$PWD/bin/togi" ~/.local/bin/togi      # bin/togi runs `python3 -I`: see "Start Togi through its launcher" below
+# 1. Get the code, and check your Python: 3.11 or newer. (The python3 that ships with macOS is 3.9; `brew install python@3.12`.)
+git clone https://github.com/tyejcoleman/togi.git && cd togi
+python3 --version
 
-# 2. Register the example bundle
+# 2. Put `togi` on your PATH through its launcher. bin/togi runs `python3 -I`: see "Start Togi through its launcher" below.
+#    Use the launcher, not a pip-installed console script.
+mkdir -p ~/.local/bin
+ln -sf "$PWD/bin/togi" ~/.local/bin/togi      # and make sure ~/.local/bin is on your PATH
+
+# 3. Register the example bundle
 togi add examples/notes
 
-# 3. What an agent does first: one call to learn everything
+# 4. What an agent does first: one call to learn everything
 togi skill                       # what Togi is + one line per bundle
 togi skill notes                 # the bundle's skill (SKILL.md), topics listed at the end
 togi tools notes                 # commands as Python stubs; --json for JSON Schema
 
-# 4. Use it (compact one-line JSON when stdout is not a terminal)
+# 5. Use it (compact one-line JSON when stdout is not a terminal)
 togi notes add --text "buy milk" --tag home
 togi notes list --fields id,text
 togi notes show --id n_9         # error: {"ok":false,"status":"error",...,"next":"togi notes find --query <words>"}
 
-# 5. A money command needs a person (who has set up an approver passphrase once, in their own terminal)
+# 6. A money command needs a person (who has set up an approver passphrase once, in their own terminal)
 togi approver setup                            # the PERSON, once, BEFORE any agent has a shell: 12+ characters, typed twice,
                                                # not shown. The approver lives in ~/.togi/approver.d (0700; fixed; not $TOGI_HOME, not $HOME)
+togi lock notes                                # the PERSON, once: reads the list, types the word, types the passphrase; money runs only locked code
 togi notes tip send --id n_1 --amount 5.00     # exit 3, returns an approval id; nothing was sent
 togi approve ap_...                            # the PERSON runs this: reads the prompt, types the word, types the passphrase
 togi notes tip send --id n_1 --amount 5.00 --approval ap_...   # now it runs, once
 
-# 6. Code mode: many calls, only what you print comes back
+# 7. Code mode: many calls, only what you print comes back
 echo 'for n in notes.list(): print(n["id"], n["text"])' | togi run -
 ```
 
@@ -67,6 +76,9 @@ $ togi notes tip send --id n_1 --amount 5.00
 A bundle is a Python package plus a `togi.toml` at the repo root. `examples/notes/` is the smallest complete
 one (commands, skills, tiers, stone tasks, tests).
 
+The snippets below are abridged and simplified from the Crowd Price bundle, a real Togi bundle (group-price drops on PayPal
+holds). `...` marks elided code; `found()` and the return values are stand-ins.
+
 ```python
 # src/crowd/togi_bundle.py
 from decimal import Decimal
@@ -77,17 +89,20 @@ bundle = Bundle("crowd")          # must match togi.toml [bundle].name
 @bundle.command("drop status", effect="read",
                 examples=["togi crowd drop status --drop d_7f3a"])
 def drop_status(drop: str, verbose: bool = False) -> dict:
-    """Show a drop's current price, buyers, time left and state."""   # first line = summary
+    """Show a drop's current price, buyers, locked step, next step, time left and state."""   # first line = summary
     ...
     return {"drop": drop, "price": Decimal("33.00"), "buyers": 52}    # Decimal/datetime become strings
 
 @bundle.command("drop settle", effect="money", confirm="drop")
-def drop_settle(drop: str, ctx: Context) -> dict:
-    """Capture the held payments for a drop."""
+def drop_settle(drop: str, expect: str, ctx: Context) -> dict:
+    """Settle a closed drop. Needs a person's approval; pass --expect from `drop plan`."""
     if not found(drop):
         raise TogiError("drop_not_found", f"No drop {drop}.", next="togi crowd drop list")
     ...
 ```
+
+A manifest in the same shape (illustrative: modelled on Crowd Price's, which has the real one, and showing every `[policy]`
+key):
 
 ```toml
 # togi.toml
@@ -101,12 +116,13 @@ skills = "skills"                 # SKILL.md (main) + <topic>.md files, frontmat
 [tiers]                           # globs relative to the repo; first match wins: locked > reshape > polish
 polish  = ["skills/**", "togi_messages.toml"]
 reshape = ["src/crowd/ladder.py"]
-locked  = ["togi.toml", "stone/**", "src/crowd/engine.py", "src/crowd/settle.py",
-           "src/crowd/togi_bundle.py", "src/crowd/__init__.py"]   # the money command's own module and package: see "The code behind a money command"
+locked  = ["togi.toml", "stone/**", "src/crowd/engine.py", "src/crowd/paypal_holds.py", "src/crowd/verify.py",
+           "src/crowd/store.py", "src/crowd/togi_bundle.py", "src/crowd/__init__.py"]   # every other module of the package, including the money command's own: see "The code behind a money command"
 
 [stone]
 tests = "tests"                   # deterministic pytest dir
 tasks = "stone/tasks"             # agent tasks (*.toml)
+env = {CROWD_ENV = "test", CROWD_PAYPAL = "fake"}   # environment for the stone's tests and agent tasks
 
 [policy]
 approve_effects = ["money"]       # money is always gated; add "write"/"admin" to gate those too
@@ -118,7 +134,7 @@ test_approvals = false            # accept grants from a throwaway (test-scope) 
 require_lock = true               # money commands need a verified `togi lock`; default true when [tiers].locked is not empty
 ```
 
-**The code behind a money command must be locked or reshape (r5).** Python imports more than the files you list: a new
+**The code behind a money command must be locked or reshape.** Python imports more than the files you list: a new
 package directory `store/` beside a locked `store.py` is imported *instead of* it, so is `store.so`, so is a `.pyc`. Togi
 therefore (1) puts every such shadow of a locked file into the lock (a new one is a changed lock: the money path says
 `lock_check_failed`), and (2) requires that every importable file (`.py`, `.so`/`.pyd`, `.pyc`, `.pth`, package directories) in
@@ -149,7 +165,7 @@ over to the launcher before it imports anything else it can (see the limits belo
 interpreter that is neither isolated nor visibly clean. A bundle's code is imported from its registered repo
 (`<repo>/src`, `<repo>`), which Togi adds explicitly; a bundle that needs third-party packages needs them installed in the
 interpreter's own site-packages, because `PYTHONPATH` no longer reaches it (and `-I` skips the per-user site directory, so
-install the optional `mcp` package for the interpreter itself, `python3 -m pip install mcp`, not with `--user`).
+install the optional `mcp` package for the interpreter itself, `python3 -m pip install 'mcp<2'`, not with `--user`).
 
 **Parameter types:** `str`, `int`, `float`, `bool` (a `--flag`; a bool defaulting to `True` gets `--no-flag`),
 `Decimal` (passed as a string, never a float), `list[str]` (repeat the flag), `Literal[...]` (choices),
@@ -173,23 +189,31 @@ matter, what needs a person. If it is missing, a page is generated from the comm
 **Stone tasks.** `stone/tasks/*.toml`:
 
 ```toml
-id = "open-drop"
+# examples/notes/stone/tasks/add-and-find.toml
+id = "add-and-find"
 holdout = false                       # holdout tasks are never shown to hone
-instruction = "Juniper needs at least 30 mugs ... open a 48h drop ..."
-setup = ["togi crowd test reset"]     # run by the harness before the agent
-budget_turns = 12                     # exceeding it fails the task
+instruction = "Add a note saying 'buy milk' tagged home, then find it by searching for milk. Tell me its id."
+setup = ["togi notes test reset"]     # run by the harness before the agent
+budget_turns = 8                      # exceeding it fails the task
+# deterministic replay for CI (script driver), one per surface:
+script = ["togi notes add --text 'buy milk' --tag home", "togi notes find --query milk"]
+script_run = """                      # the same task for the `run` surface
+notes.add(text="buy milk", tag=["home"])
+print(notes.find(query="milk"))
+"""
+script_mcp = [                        # ... and for the `mcp` surface
+  {tool = "notes_add", args = {text = "buy milk", tag = ["home"]}},
+  {tool = "notes_find", args = {query = "milk"}},
+]
+
 [[check]]                             # all checks must pass, run after the agent finishes
-cmd = "togi crowd drop list --json"
-expect_jsonpath = "$.data[0].state"   # also: contains / matches instead of equals
-equals = "live"
+cmd = "togi notes list --json"
+expect_jsonpath = "$.data[0].text"    # also: contains / matches instead of equals
+equals = "buy milk"
 [[check]]
-transcript_contains = "$33"           # checks the agent's final answer
+transcript_contains = "n_1"           # checks the agent's final answer
 [[forbid]]
 command_prefix = "togi approve"       # the agent must never attempt this
-# deterministic replay for CI (script driver):
-script = ["togi crowd test reset", "togi crowd drop open --sku mug ..."]
-script_run = "crowd.drop_open(sku='mug')"                       # same task for the `run` surface
-script_mcp = [{tool = "crowd_drop_open", args = {sku = "mug"}}]  # ... and the `mcp` surface
 ```
 
 Test your bundle's own pytest dir with `PYTHONPATH=src:<togi>/src python3 -m pytest tests`.
@@ -263,15 +287,32 @@ journal -> stone -> hone -> review -> apply -> audit log        (revert undoes a
    command, top error codes, repeated retries, unknown flags/commands, truncated outputs, `--help` lookups.
 2. **Stone.** `togi stone <bundle>` runs the deterministic tests plus the agent tasks in throwaway sandboxes (own
    `$TOGI_HOME`, empty cwd, `togi` on PATH). `--driver script` replays `script = [...]` (deterministic, CI).
-   `--driver claude` runs `claude -p` with `--tools=Bash --allowedTools "Bash(togi:*)"`, a fixed system prompt, no
-   session persistence and `TOGI_AGENT=stone`; it records success, turns, cost/usage, wall time, the journal
-   slice and forbidden attempts. API keys are scrubbed from the agent's environment so it runs on your
-   subscription. `--surface cli|run|mcp` picks how the agent is told to work. On the `mcp` surface the agent has no
-   shell: it gets the Togi MCP server as its only tools (`mcp__togi__<bundle>_...`, starting with `..._skill`), and the
-   system prompt names them. That surface cannot use `--safe-mode` (this Claude Code build switches MCP servers off in
-   safe mode, which left the agent with no tools at all), so it is isolated with `--setting-sources ""
-   --disable-slash-commands --strict-mcp-config` instead. A task's wall clock is enforced by killing the agent's whole
-   process group.
+   `--driver claude` runs `claude -p` with a fixed system prompt, `--permission-prompts none`, no session persistence and
+   `TOGI_AGENT=stone`; it records success, turns, cost/usage, wall time, the journal slice and forbidden attempts. API
+   keys are scrubbed from the agent's environment so it runs on your subscription. `--surface cli|run|mcp` picks how the
+   agent is told to work. A task's wall clock is enforced by killing the agent's whole process group.
+
+   *What the claude driver confines.* On the `cli` and `run` surfaces it passes `--safe-mode --restricted --permission-mode
+   dontAsk --tools=Bash --allowedTools "Bash(togi:*)"`. `--tools=Bash` offers the agent no built-in tool except Bash.
+   `--restricted` makes Claude Code ignore your user, project and local settings files, so none of your own allow rules
+   apply (a `Bash(*)` rule, or a permissive default mode in `~/.claude/settings.json`, would otherwise let the agent run
+   commands other than `togi`: an allow rule only adds to the permissions you already have). `--permission-mode dontAsk`
+   denies every command the rule `Bash(togi:*)` does not name. `--safe-mode` turns off CLAUDE.md, hooks, skills, plugins and
+   MCP servers. (Checked with Claude Code 2.1.310 on an account whose user settings allow `Bash(*)`: with the allow rule
+   alone a `mkdir` ran; with these flags it was denied.) The stone and the `claude-cli` provider of `togi eval` build this
+   from one list (`BASH_TOGI_ONLY` in `stone.py`), and `TOGI_CLAUDE_ARGS` is placed before it on the command line. A Claude
+   Code that does not accept `--restricted` or `--permission-mode dontAsk` is an error, not a fallback: the task reports a
+   driver error that says to update Claude Code, and nothing runs without the flags. Two limits remain: the confinement is
+   Claude Code's own permission system, so it holds only as far as that does, and the forbidden-command check reads the
+   journal, so it sees `togi` calls only. `hone`, the eval judge and the `claude-step` provider offer no tools at all
+   (`--tools=`), so there is nothing for a rule to widen.
+
+   On the `mcp` surface the agent has no shell and no built-in tool: its only tools are the Togi MCP server's
+   (`mcp__togi__<bundle>_...`, starting with `..._skill`), and the system prompt names them. This surface cannot use
+   `--safe-mode`, because Claude Code's safe mode also switches off MCP servers and the agent would have no tools. It is
+   isolated with `--setting-sources "" --disable-slash-commands --strict-mcp-config` instead: no user, project or local
+   settings are read (so none of your allow rules apply), no skills or slash commands load, and only the Togi server is
+   used. Some installed plugins and agents may still load.
 3. **Hone.** `togi hone <bundle>` asks an agent (`claude -p`, no tools) for a unified diff and rationale, given
    the *polish and reshape files only*, the friction summary and the latest non-holdout failures. It writes
    `$TOGI_HOME/proposals/<id>/{diff.patch,rationale.md,meta.json}`. A diff that touches a locked file, a file in
@@ -285,7 +326,7 @@ journal -> stone -> hone -> review -> apply -> audit log        (revert undoes a
    |---|---|
    | locked (or no tier), or a path that cannot be judged (see below) | never |
    | any tier, if deterministic tests < 100%, forbidden attempts > 0, holdout success drops, or visible task success drops | rejected |
-   | reshape | needs a person **twice**: first to let its code run in the stone at all (see below), then to apply it: each time a terminal, a typed confirmation word and the passphrase of the **default** approver (r3: not a `TOGI_APPROVER_HOME` one) |
+   | reshape | needs a person **twice**: first to let its code run in the stone at all (see below), then to apply it: each time a terminal, a typed confirmation word and the passphrase of the **default** approver (not a `TOGI_APPROVER_HOME` one) |
    | polish touching anything that is not plain text. Allowed: `.md` `.txt` `.json` `.yaml` `.yml`, and `.toml` other than `pyproject.toml` / `togi.toml`. Everything else counts as code (`.py` `.sh` `.js` `.cfg` `.ini` `.html` `.pth`, a `Makefile`, a file with no extension...), and so does content starting with `#!` | never: rejected, at `hone` and again at `apply` |
    | polish | auto-applies only if `policy.auto_polish`, **and** it improves something by more than noise: at least 1 task, or a **median turns / tokens / cost improvement of at least 15% whose worst run is no worse than the old median**. Otherwise rejected. With `auto_polish = false` it waits for a person |
    | polish, touching a skill file, evaluated by the `script` driver | never auto-applies: it needs an agent driver (`claude`), otherwise it waits for a person |
@@ -298,7 +339,7 @@ journal -> stone -> hone -> review -> apply -> audit log        (revert undoes a
    terminal, been shown the diff itself, typed the word and the approver passphrase. That approval is signed with the
    approver key, bound to this diff and the files it applies to, and recorded in the proposal's `meta.json`
    (`evaluation_approval`) and in the audit log (`evaluate`); editing `meta.json` by hand proves nothing, and neither does a
-   record signed by a throwaway (`test`-scope) approver (r3: only the default scope counts). Without it
+   record signed by a throwaway (`test`-scope) approver (only the default scope counts). Without it
    `togi apply` exits 3 (`needs_human`, `reason: evaluation_needs_human`) and nothing runs. After the evaluation, applying
    it is a second human decision, as before. A diff over 1000 lines cannot be shown in full at the prompt, so its
    evaluation cannot be approved.
@@ -317,7 +358,7 @@ journal -> stone -> hone -> review -> apply -> audit log        (revert undoes a
 
 5. **Audit log.** `<repo>/.togi/audit.jsonl`: one hash-chained entry per apply / reject / revert / evaluate (and `lock`):
    `seq, ts, action, proposal, tier, files, diff_sha256, stone_before, stone_after, decided_by, reason, scope, prev_hash,
-   kid, hash, mac`. `scope` (r3) is the approver scope the writing process ran under, `default` or `test`; it is inside the
+   kid, hash, mac`. `scope` is the approver scope the writing process ran under, `default` or `test`; it is inside the
    hash and the mac, and for `lock` / `revert` / `evaluate` / a human `apply` it is always `default`, because those
    refuse a test approver (older entries have no `scope` and still verify). `mac` is an HMAC over `hash` under `$TOGI_HOME/audit.key` (0600), so someone with only the repo cannot
    re-seal a rewritten chain. Lines are pure ASCII and read by splitting on `\n` only. `togi log <bundle> --verify`
@@ -362,7 +403,8 @@ togi eval outcome new notes-job                        # writes outcomes/notes-j
 
 # a suite: a bundle's stone tasks, or seeded questions whose answers are computed by SQL over the data (never by a model)
 togi eval suite import-stone notes --out suites/notes
-togi eval generate sheet --seed 7 --out suites/sheet --bundle sheet=../togi-bundles/sheet     # dev / test / unseen BY WORLD
+# the `sheet` bundle is a separate project and is not included here; --bundle sheet=PATH points the items at your checkout of it
+togi eval generate sheet --seed 7 --out suites/sheet     # dev / test / unseen BY WORLD
 togi eval lock suites/sheet --outcome outcomes/notes-job.toml --repeats 3     # hash every item, pre-register the plan
 
 # a matrix: subjects x items x repeats, parallel, resumable, cost-capped; the oracle replays each item's reference trajectory
@@ -518,7 +560,7 @@ togi eval items <run> | audit <run> --class C | contamination --suite S [--data 
 
 Every host command honours `--fields`, `--limit`/`--offset` (on lists) and the ~8 KB cap (`--full` lifts it); so do
 errors and `--dry-run` output. `togi run --max-output N` raises the 8192-byte cap on what a script prints, but **never past
-1,000,000 bytes**, the same ceiling `--full` has (r5: a larger `N` is clamped, not honoured).
+1,000,000 bytes**, the same ceiling `--full` has (a larger `N` is clamped, not honoured).
 
 Environment: `TOGI_HOME` (default `~/.togi`; moves the registry, journals, approvals, proposals and audit key, but **not** the
 approver, which lives in `~/.togi/approver.d`; a `TOGI_HOME` that is, contains or sits inside the approver's directory is refused,
@@ -560,8 +602,8 @@ commands; the agent gets only a thin client over a socket.
 A **plain copy** of your approver (its files copied, not linked) used as a test approver is **not detected**. Togi tells your own
 approver from a test one by its place: `TOGI_APPROVER_HOME` naming the fixed directory by another path, or approver files that are
 the fixed approver's own (a link, a hard link). A copy of the files is only more files. The desk therefore opens for it without a
-terminal, as for any test approver; what it signs is test scope, and a bundle decides what that is worth (Crowd honours it only on
-its Pretend PayPal, where no money moves). A same-user process can make a test approver of its own anyway, so the copy adds no new
+terminal, as for any test approver; what it signs is test scope, and a bundle decides what that is worth (Crowd honours it only in
+its test mode, where no money moves). A same-user process can make a test approver of its own anyway, so the copy adds no new
 power, but "the desk opened without a terminal" does not prove the approver is not yours.
 
 The sandbox below narrows what a `togi run` script is, but it is a same-user process under a profile, not a VM.
@@ -578,7 +620,7 @@ What is enforced in code:
   (spent even if the function then fails). Each line is MAC'd and chained to the one before and a head pointer counts the
   lines, so a deleted, edited or reordered line makes every approval refuse (`spent_log_damaged`) until a person looks.
   The `.claimed` marker beside the approval is a second witness.
-- **The money path checks the lock (r4).** A gated command is refused, at request time and again at use time, unless the
+- **The money path checks the lock.** A gated command is refused, at request time and again at use time, unless the
   bundle's lock verifies (`togi lock`, anchored in the signed audit log, no hidden symlinks, log authenticated). If there is
   no lock file at all, a bundle with locked tiers (`[tiers].locked` not empty) is refused (`not_locked`) unless its
   manifest says `[policy] require_lock = false` outright; a bundle with no locked tier needs none. A lock file that exists
@@ -591,19 +633,18 @@ What is enforced in code:
   a command-line match is a second check); an interpreter that is **isolated** (`python -I`, which is how `bin/togi` starts)
   or at least visibly clean (no `PYTHON*` variable, no current directory on `sys.path`); the typed confirmation word; and
   **the approver passphrase**.
-- **What you are shown is what is signed (r4, r5).** The pending approval is a file the requesting agent wrote, so
+- **What you are shown is what is signed.** The pending approval is a file the requesting agent wrote, so
   `togi approve` does not trust it. Before it asks you anything it recomputes the arguments' hash from the arguments it is
   about to show, the binding (repo path, version, lock-set digest) from the live repo, and the lock state from the live
   lock; it recomputes the summary and the confirmation word **as plain data from the describe snapshot `togi lock` signed**
-  (r5: it imports nothing; r4 loaded the bundle in a child process, which could still run the bundle's import-time code
+  (it imports nothing: loading the bundle, even in a child process, could still run the bundle's import-time code
   while you were about to decide); it refuses on any mismatch with the pending record (`approval_tampered`,
   `approval_stale`, `lock_check_failed`, `not_locked`, `gated_code_unlocked`), refuses an argument too long to be shown whole
   (`prompt_too_long`: you cannot sign what you cannot see), shows the recomputed values and **the expiry that will be signed**
-  (r5; not the one the requester wrote into the file), and signs them. If the record changes between the check and the
+  (not the one the requester wrote into the file), and signs them. If the record changes between the check and the
   signature, nothing is signed (`approval_changed`).
 - **The approver passphrase.** A TTY check alone stops an agent using a normal shell, but an agent that can run
-  `script(1)` or a pty library can give `togi approve` a terminal and type the word itself (the Opus refuter did exactly
-  that). So a person sets up a passphrase once, in their own terminal: `togi approver setup` (12+ characters, typed
+  `script(1)` or a pty library can give `togi approve` a terminal and type the word itself. So a person sets up a passphrase once, in their own terminal: `togi approver setup` (12+ characters, typed
   twice, read from `/dev/tty` with echo off, never from a pipe). Only an scrypt hash and salt are stored, in
   `approver` (0600, in `~/.togi/approver.d`). Every human-only action then asks for it after the typed word. `togi approver setup` on a machine
   that already has an approver asks for the *current* passphrase first and otherwise changes nothing. Wrong attempts are counted:
@@ -638,23 +679,24 @@ What is enforced in code:
     knows its passphrase; the bundle decides what its yes is worth, as on the terminal path), but a `TOGI_APPROVER_HOME`
     that is your own approver by another path (a symlink to `~/.togi/approver.d`, its files linked in) is treated as your own
     and needs the terminal. A passphrase that cannot be encoded (a lone surrogate from a page) counts as a wrong one.
-- **The approver lives where an agent cannot move it (r2), in a directory of its own (r5).** The approver (`approver`,
+- **The approver lives where an agent cannot move it, in a directory of its own.** The approver (`approver`,
   `approver.state`, the signing key `approver.key` and the spent-approval log) is kept in `<pw_dir>/.togi/approver.d` (mode
   0700), where `pw_dir` is your account's home directory from the password database, **not** `$HOME` and **not**
-  `$TOGI_HOME`. (r4 kept the files loose in `<pw_dir>/.togi`, which is also the default `$TOGI_HOME`, so the journals,
-  approvals and registry shared a directory with the key and the passphrase record. They move into `approver.d` once, at your
-  first human command after upgrading (or `togi approver migrate`), never from an agent session; if the same file exists in both
-  places, Togi refuses until you resolve it.) In r1 it sat in `$TOGI_HOME`, an ordinary environment variable, so an
-  agent could set `TOGI_HOME=/tmp/mine`, `togi add` a bundle there, create an approver of its own with a fake terminal,
-  approve its own money command and run it. Now `TOGI_HOME` moves everything *except* the approver, and the wrong-attempt
-  counter cannot be reset by starting over in a new home. A `TOGI_HOME` that equals, contains or sits inside the approver's
-  directory (other than the default `~/.togi` that holds `approver.d`) is refused (`togi_home_unsafe`).
-- **Grants are signed (r2).** When a person grants or denies, the approver key signs the record
+  `$TOGI_HOME`. It has a directory of its own because the default `$TOGI_HOME` (`<pw_dir>/.togi`) also holds the journals,
+  approvals and registry, which should not share a directory with the key and the passphrase record. Approver files that
+  an earlier layout left loose in `<pw_dir>/.togi` move into `approver.d` once, at your first human command (or `togi
+  approver migrate`), never from an agent session; if the same file exists in both places, Togi refuses until you resolve it.
+  If the approver followed `$TOGI_HOME`, an ordinary environment variable, an agent could set `TOGI_HOME=/tmp/mine`, `togi
+  add` a bundle there, create an approver of its own with a fake terminal, approve its own money command and run it. So
+  `TOGI_HOME` moves everything *except* the approver, and the wrong-attempt counter cannot be reset by starting over in a new
+  home. A `TOGI_HOME` that equals, contains or sits inside the approver's directory (other than the default `~/.togi` that
+  holds `approver.d`) is refused (`togi_home_unsafe`).
+- **Grants are signed.** When a person grants or denies, the approver key signs the record
   (`grant_mac`, an HMAC-SHA256 over id, bundle, command, args hash, binding hash, status, expiry, decider, scope and the
   `$TOGI_HOME` it was made in). `togi <bundle> … --approval ap_…` verifies the signature with the key in the approver
   home and refuses (`approval_unsigned`) otherwise, so a record that was forged, edited (a longer expiry, a flipped
   "denied"), copied from another `$TOGI_HOME`, or made by another approver is worthless.
-- **Test approvers and `ctx.approval_scope` (r2).** Tests, the stone and CI need an approver that is not yours:
+- **Test approvers and `ctx.approval_scope`.** Tests, the stone and CI need an approver that is not yours:
   set `TOGI_APPROVER_HOME` to a throwaway directory and set it up there. Everything that approver signs carries
   `scope: "test"` (the fixed approver signs `scope: "default"`), a process only honours grants of its own scope, and Togi
   hands the verified scope to the command as `ctx.approval_scope` (`"default"`, `"test"`, or `None` when there was no
@@ -671,8 +713,8 @@ What is enforced in code:
   `togi doctor` warns while `TOGI_APPROVER_HOME` is set, `togi approver status` shows the scope, and the approval prompt
   says "TEST scope" when it is one. The stone sandbox and the bundle tests it runs get a throwaway approver of their own.
 
-  **A bundle must opt in before Togi accepts a test-scope grant at all (r4).** Relying on every bundle to remember the
-  check above meant a bundle that forgot it moved real money on a grant anyone could mint. Now a `test`-scope grant for a
+  **A bundle must opt in before Togi accepts a test-scope grant at all.** If this relied on every bundle remembering the
+  check above, a bundle that forgot it would move real money on a grant anyone could mint. So a `test`-scope grant for a
   gated command is refused (`test_scope_refused`) unless the manifest says `[policy] test_approvals = true`: `togi approve`
   under a test approver refuses up front, and a grant minted anyway is refused when it is used. Opt in only when the
   command checks `ctx.approval_scope` itself (as `examples/notes` does, with `NOTES_TEST_MODE`), or only has fakes to move.
@@ -691,10 +733,10 @@ What is enforced in code:
   `approver.key` and sign a grant: the key is a plain 0600 file, so the fixed location and the signature stop an agent that
   redirects `$TOGI_HOME` or edits and copies records, not a same-user process with full file access** (v0.2: keychain or
   out-of-band approver). The audit key still follows `$TOGI_HOME`.
-- **Repo-changing gates take only the default approver (r3).** `togi lock`, `togi revert`, the approval to *evaluate* a
+- **Repo-changing gates take only the default approver.** `togi lock`, `togi revert`, the approval to *evaluate* a
   reshape proposal and a human `togi apply` decide what code a bundle's repo may contain, so they accept only the approver
   in `<pw_dir>/.togi/approver.d` (scope `default`). While `TOGI_APPROVER_HOME` is set they refuse (`test_scope_refused`, exit 2)
-  before asking for the typed word or a passphrase. In r2 they accepted a test-scope approver, and anyone can make one:
+  before asking for the typed word or a passphrase. Anyone can make a test-scope approver, so if they accepted one,
   an agent that can write a repo could edit a locked money file, set up a throwaway approver on a pseudo-terminal
   (`TOGI_APPROVER_HOME=/tmp/x togi approver setup`) and `togi lock` the modified code, which defeats the locked tier. The
   rule has no exceptions (no carve-out for "example" bundles): a person who needs the repo gates runs them with
@@ -751,8 +793,7 @@ What is **not** a security boundary (v0.1):
   and verify it in CI.
 - **`.togi/locked.sha256` is a plain file in the repo, but it is anchored.** `togi lock` records it (default approver
   only) and signs a `lock` entry into the audit log; the lock only counts if it is exactly what the latest such entry
-  recorded and that entry carries this machine's key id and a valid mac (r2/r3 added the comparison, r4 the signature
-  check on the entry it relies on). So an agent that can write the repo cannot edit a locked file, rewrite `locked.sha256`
+  recorded and that entry carries this machine's key id and a valid mac. So an agent that can write the repo cannot edit a locked file, rewrite `locked.sha256`
   and have anything accept it: `togi doctor` reports it, `apply`/`revert` refuse it and the money path refuses it. What it
   cannot stop is someone who can also read `$TOGI_HOME/audit.key` (they can sign a `lock` entry) or who can truncate the
   log and the head pointer together. Commit the log and the lock file, and read `git diff` on locked files.
@@ -765,9 +806,9 @@ What is **not** a security boundary (v0.1):
   planted-file case, but code that has already run in such a process is not undone. A project-local `.togi/bundles.toml` in
   the current directory (or any parent) still overrides the global registry; the approval prompt and `togi lock` show the repo path
   they act on, so read it.
-- **`togi approve` never imports the bundle (r5).** In r4 it loaded the bundle in a scrubbed child to regenerate the summary,
-  but that child was an ordinary same-user process: import-time code could write files or read your disk while you were about
-  to decide. Now the summary and the word you type are recomputed as plain data from the **describe snapshot** that `togi lock`
+- **`togi approve` never imports the bundle.** Loading it in a scrubbed child to regenerate the summary would still start
+  an ordinary same-user process: import-time code could write files or read your disk while you were about to decide. So
+  the summary and the word you type are recomputed as plain data from the **describe snapshot** that `togi lock`
   signed (`.togi/describe.json`, HMAC under the audit key, valid only for that lock and that repo path) and compared with what
   the request filed. Reading the bundle happens only in the sandboxed child (the `togi run` strict profile family: no network,
   writes only to its own temp dir, `$TOGI_HOME`, the approver and other repos hidden; its own session so no terminal; scrubbed
@@ -777,14 +818,14 @@ What is **not** a security boundary (v0.1):
   audit key, a plain file in `$TOGI_HOME`: it stops an agent that can write the repo, not one that can read `$TOGI_HOME`. If a
   reshape change alters a gated command's name, summary or parameters, the request (built from the live command) no longer
   matches the snapshot and `approve` refuses until a person re-locks.
-- **What the r5 lock covers, and what it does not.** The lock set is every locked file plus whatever Python would import in
+- **What the lock covers, and what it does not.** The lock set is every locked file plus whatever Python would import in
   place of it; the money path additionally refuses untiered code in the package of a gated command and any untiered repo
   module the bundle has loaded. It does **not** hash `reshape` files (they are allowed behind a money command because changing
   one through `togi apply` needs the real approver; an agent that can write the repo directly can still edit a reshape file
   without the digest noticing, so keep reshape code to behaviour you are content to have a person review in `git diff`), it
   cannot see a module a gated command imports lazily from outside its package until something has loaded it (keep gated code
   in one package), and it says nothing about code installed outside the repo (site-packages, the standard library).
-- **Bytecode and import order are Togi's, not the repo's (r5).** Bundle code is compiled from source on each start (the cost of
+- **Bytecode and import order are Togi's, not the repo's.** Bundle code is compiled from source on each start (the cost of
   never trusting a `.pyc` found in the repo); output a bundle writes below Python (`os.write(2, ...)`, a subprocess that inherits
   the descriptor) is not captured by the stdout/stderr caps.
 - **Proposal files are plain files in `$TOGI_HOME`.** `apply` re-classifies the diff text it actually reads, re-checks the
@@ -811,15 +852,20 @@ What is **not** a security boundary (v0.1):
   evaluation or a person), why an improvement must beat 15% with a no-worse worst run, and why `togi review` is there
   for you to read the diff. The hard gates (deterministic tests, forbidden attempts, holdout tasks) and the money
   approvals are what keep a bad edit from mattering.
-- **The claude driver trusts Claude Code's permission system** to keep the stone agent to `Bash(togi:*)` (or, on the
-  MCP surface, to the one Togi MCP server). The MCP surface is isolated with `--setting-sources ""` rather than
-  `--safe-mode`, which still lets some installed plugins and agents load.
+- **The claude driver relies on Claude Code's permission system.** On the `cli` and `run` surfaces it passes `--restricted
+  --permission-mode dontAsk` with the allow rule `Bash(togi:*)`, so none of your own Claude Code allow rules apply and every
+  other command is denied. A Claude Code that does not accept those flags is refused, not worked around. The confinement is
+  only as strong as Claude Code's own permission checks, and the forbidden-command check sees `togi` calls in the journal,
+  not other commands. The `mcp` surface offers no built-in tools and reads no settings files; it is isolated with
+  `--setting-sources ""` rather than `--safe-mode`, and some installed plugins and agents may still load. Details:
+  "Self-improvement loop", step 2.
 - The journal is best-effort: a full disk drops lines rather than failing a command.
 
 ## Development
 
 ```sh
-python3 -m pytest -q            # the whole suite (2-3 minutes; it spawns real subprocesses, ptys and sandboxes)
+python3 -m pip install -e '.[dev,mcp]'   # pytest, and the optional mcp package that the MCP tests need (a virtualenv is fine)
+python3 -m pytest -q            # the whole suite (about 8 minutes; it spawns real subprocesses, ptys and sandboxes)
                                 # tests never touch the real approver: each gets a throwaway TOGI_APPROVER_HOME (test scope),
                                 # the lock/revert/apply tests use a default-scope approver in a faked <pw_dir>/.togi/approver.d, and a guard
                                 # fails any test that changes an approver file (or approver.d) in the real <pw_dir>/.togi
@@ -834,3 +880,7 @@ spent-approval record, `approver.py` the passphrase, `journal.py`, `runmode.py` 
 `answers.py` + `taskrec.py` + `schema.py` the structured answer, the task record and a small JSON Schema validator,
 `evals/` the eval layer: outcome, items, checks, subject, loops, policy, providers, cell, runner, store, stats, analysis, taxonomy,
 integrity, report, `generators/sheet.py`), `examples/notes/`, `tests/`, `docs/`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -63,7 +63,7 @@ the real-home guard passing.
   registered bundle module (or only allows the stdlib dir). Test with a fake installed module.
 
 ## Constraints
-- Do not touch `~/Development/closure`. A separate small change there will opt Crowd into
+- This round changes Togi only. A separate small change in the Crowd Price repository opts Crowd into
   `test_approvals` and `require_lock`.
 - Never write the real `<pw_dir>/.togi`.
 - No `claude -p`. No broad `pkill`. Do not commit.

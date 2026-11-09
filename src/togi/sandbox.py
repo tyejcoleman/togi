@@ -10,8 +10,9 @@ that is not Python itself or the child's own temp directory:
     exist, how big) stays visible; contents and directory listings of your home, other volumes, other programs'
     temp files, every registered bundle repo (`.env` files included) and `$TOGI_HOME` do not;
   - file reads, level "standard" (used if "strict" cannot start Python on this machine): the same, but by denying the
-    user-data zones (/Users, /Volumes, the temp areas, your home, every repo, `$TOGI_HOME`) instead of allowing only
-    the system ones;
+    contents of the user-data zones (/Users, /Volumes, the temp areas, your home, every repo, `$TOGI_HOME`) instead of
+    allowing only the system ones. File metadata stays visible here too, as in "strict" (Python cannot start from a
+    virtualenv under /Users or /private/tmp without it); contents and directory listings do not;
   - file writes: only the child's temp directory (and /dev/null, /dev/tty);
   - other processes: `process-info` and signals to processes outside the sandbox are denied.
 
@@ -143,6 +144,11 @@ def build_profile(*, tmp: str, repos: list[str], togi_home: str, home: str, stri
                   "(allow file-read* " + " ".join(f"(subpath {_q(z)})" for z in STRICT_READ) + ")"]
     else:
         lines.append("(deny file-read* " + " ".join(f"(subpath {_q(z)})" for z in (*DENY_READ_ZONES, home)) + ")")
+        # As in the strict profile, metadata (stat: does a path exist, how big) stays visible. Without it Python cannot
+        # resolve its own executable's path at start-up when a virtualenv lives under /Users or /private/tmp. This specific
+        # allow outranks the generic `file*` deny of the repos and $TOGI_HOME below, so their existence and size are visible
+        # (their contents, listings and writes stay denied), exactly as in the strict profile.
+        lines.append("(allow file-read-metadata)")
     lines += [f"(allow file-read* (subpath {_q(r)}))"
               for r in sorted({*python_roots(), *(real(d) for d in site or []), *(real(d) for d in readable)})]
     lines.append(f"(allow file-read* file-write* (subpath {_q(tmp)}))")

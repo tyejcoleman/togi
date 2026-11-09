@@ -23,6 +23,16 @@ import sys
 if sys.platform != "win32":
     sys.modules.update(dict.fromkeys(("winreg", "_winapi", "msvcrt"), None))
 
+# Togi uses `tomllib` and other 3.11 features. On an older python3 (the one that ships with macOS is 3.9) the first import would
+# end in a traceback about a missing module, so say what is wrong instead. This runs before any import but `sys`, uses only `sys`,
+# and is written so that it parses on old interpreters too.
+if sys.version_info < (3, 11):
+    sys.stderr.write(
+        "togi: Togi needs Python 3.11 or newer, and python3 here is %d.%d.%d (%s).\n"
+        "Install a newer Python (on macOS: brew install python@3.12) and make sure `python3` on your PATH is that one.\n"
+        % (sys.version_info[0], sys.version_info[1], sys.version_info[2], sys.executable or "unknown path"))
+    sys.exit(1)
+
 import os  # noqa: E402
 
 
